@@ -1,0 +1,14 @@
+model_path: outputs/qwen-tool-calling-merged
+device_map: auto
+dtype: null
+prompt: Find the sum of a = [1, -1, 2] and b = [3, 0, -4].
+system_prompt: You are a helpful tool-calling assistant.
+tool_registry: sample
+tools:
+  - get_vector_sum
+  - get_dot_product
+generation:
+  max_new_tokens: 256
+  do_sample: false
+  temperature: 0.0
+  top_p: 1.0

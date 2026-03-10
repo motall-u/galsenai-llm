@@ -1,0 +1,7 @@
+backend: unsloth
+adapter_path: outputs/qwen-tool-calling-lora
+output_dir: outputs/qwen-tool-calling-merged
+max_seq_length: 4096
+dtype: null
+load_in_4bit: false
+save_method: merged_16bit

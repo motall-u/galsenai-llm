@@ -1,0 +1,31 @@
+project_name: smoke-unsloth-qwen-tool-calling
+model:
+  backend: unsloth
+  model_name: unsloth/Qwen2.5-Coder-1.5B-Instruct
+  max_seq_length: 2048
+  dtype: null
+  load_in_4bit: true
+  trust_remote_code: true
+  full_finetuning: false
+data:
+  train_file: data/samples/finetune_sample.jsonl
+training:
+  output_dir: outputs/smoke-unsloth-qwen-tool-calling
+  seed: 3407
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 1
+  num_train_epochs: 1.0
+  max_steps: 1
+  learning_rate: 2.0e-4
+  warmup_steps: 0
+  logging_steps: 1
+  save_steps: 1
+  weight_decay: 0.0
+  lr_scheduler_type: linear
+  optim: adamw_8bit
+  packing: false
+  assistant_only_loss: false
+  gradient_checkpointing: unsloth
+  max_length: 2048
+  report_to: []

@@ -1,0 +1,43 @@
+project_name: qwen-tool-calling-sample
+model:
+  backend: unsloth
+  model_name: unsloth/Qwen2.5-Coder-1.5B-Instruct
+  max_seq_length: 4096
+  dtype: null
+  load_in_4bit: true
+  trust_remote_code: true
+lora:
+  r: 16
+  lora_alpha: 16
+  lora_dropout: 0.0
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+data:
+  train_file: data/samples/finetune_sample.jsonl
+  eval_file: data/samples/benchmark_sample.jsonl
+training:
+  output_dir: outputs/qwen-tool-calling-lora
+  seed: 3407
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 4
+  num_train_epochs: 1.0
+  learning_rate: 1.0e-4
+  warmup_steps: 5
+  logging_steps: 1
+  save_steps: 25
+  weight_decay: 0.01
+  lr_scheduler_type: cosine
+  optim: adamw_8bit
+  packing: false
+  assistant_only_loss: false
+  gradient_checkpointing: unsloth
+  max_length: 4096
+  report_to: []

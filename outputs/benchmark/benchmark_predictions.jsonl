@@ -1,0 +1,4 @@
+{"id": "benchmark-no-tool-001", "assistant": {"role": "assistant", "content": "Can we have the report ready by noon, please?"}}
+{"id": "benchmark-single-tool-001", "assistant": {"role": "assistant", "tool_calls": [{"id": "call_get_vector_sum_bench_001", "type": "function", "function": {"name": "get_vector_sum", "arguments": {"a": [5, -2, 1], "b": [4, 3, 0]}}}]}}
+{"id": "benchmark-multi-tool-001", "assistant": {"role": "assistant", "tool_calls": [{"id": "call_fetch_item_by_name_bench_001", "type": "function", "function": {"name": "fetch_item_by_name", "arguments": {"item_name": "Apple"}}}]}}
+{"id": "benchmark-reasoning-tool-001", "assistant": {"role": "assistant", "tool_calls": [{"id": "call_get_vector_sum_bench_002", "type": "function", "function": {"name": "get_vector_sum", "arguments": {"a": [1, 2, 3], "b": [-1, 0, 4]}}}]}}

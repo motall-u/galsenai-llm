@@ -1,0 +1,11 @@
+# Change mode to `transformers` after you have a merged model in outputs/qwen-tool-calling-merged.
+mode: oracle
+dataset_file: data/samples/benchmark_sample.jsonl
+report_file: outputs/benchmark/sample_report.json
+model_path: outputs/qwen-tool-calling-merged
+tool_registry: sample
+generation:
+  max_new_tokens: 256
+  do_sample: false
+  temperature: 0.0
+  top_p: 1.0

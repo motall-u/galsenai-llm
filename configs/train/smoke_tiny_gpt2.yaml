@@ -1,0 +1,32 @@
+project_name: smoke-tiny-gpt2
+model:
+  backend: transformers
+  model_name: sshleifer/tiny-gpt2
+  max_seq_length: 512
+  dtype: null
+  load_in_4bit: false
+  trust_remote_code: false
+  full_finetuning: true
+  device_map: cpu
+data:
+  train_file: data/samples/finetune_sample.jsonl
+training:
+  output_dir: outputs/smoke-tiny-gpt2
+  seed: 3407
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 1
+  num_train_epochs: 1.0
+  max_steps: 1
+  learning_rate: 5.0e-4
+  warmup_steps: 0
+  logging_steps: 1
+  save_steps: 1
+  weight_decay: 0.0
+  lr_scheduler_type: linear
+  optim: adamw_torch
+  packing: false
+  assistant_only_loss: false
+  gradient_checkpointing: false
+  max_length: 512
+  report_to: []

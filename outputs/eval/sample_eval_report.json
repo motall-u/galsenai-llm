@@ -1,0 +1,62 @@
+{
+  "by_category": {
+    "multi_tool": {
+      "accuracy": 1.0,
+      "count": 1
+    },
+    "no_tool": {
+      "accuracy": 1.0,
+      "count": 1
+    },
+    "reasoning_tool": {
+      "accuracy": 1.0,
+      "count": 1
+    },
+    "single_tool": {
+      "accuracy": 1.0,
+      "count": 1
+    }
+  },
+  "dataset_file": "data/samples/benchmark_sample.jsonl",
+  "overall_accuracy": 1.0,
+  "predictions_file": "outputs/benchmark/benchmark_predictions.jsonl",
+  "rows": [
+    {
+      "category": "no_tool",
+      "content_match": true,
+      "decision_match": true,
+      "id": "benchmark-no-tool-001",
+      "overall_match": true,
+      "tool_arguments_match": true,
+      "tool_names_match": true
+    },
+    {
+      "category": "single_tool",
+      "content_match": true,
+      "decision_match": true,
+      "id": "benchmark-single-tool-001",
+      "overall_match": true,
+      "tool_arguments_match": true,
+      "tool_names_match": true
+    },
+    {
+      "category": "multi_tool",
+      "content_match": true,
+      "decision_match": true,
+      "id": "benchmark-multi-tool-001",
+      "overall_match": true,
+      "tool_arguments_match": true,
+      "tool_names_match": true
+    },
+    {
+      "category": "reasoning_tool",
+      "content_match": true,
+      "decision_match": true,
+      "id": "benchmark-reasoning-tool-001",
+      "overall_match": true,
+      "tool_arguments_match": true,
+      "tool_names_match": true
+    }
+  ],
+  "total_examples": 4
+}
