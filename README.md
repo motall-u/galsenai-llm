@@ -160,3 +160,26 @@ See [data/README.md](data/README.md) for full authoring guidance and a minimal e
 - Training and local generation dependencies are kept behind `uv` extras so the repo can stay lightweight by default.
 - The sample benchmark is deterministic and uses fixed local tool outputs instead of live external APIs.
 - The CLI assumes your finetuning dataset follows the format documented in [data/README.md](/home/motall-u/my_projects/galsenai-llm/data/README.md).
+
+## Timeline
+
+### 2026-03-10 -- Project initialization
+
+- Initialized the repository and set up the `uv`-managed Python package (`pyproject.toml`, extras for train/unsloth/dev).
+- Built the full CLI-first architecture with Typer: `train`, `merge`, `evaluate`, `infer`, `benchmark`, and `data validate` commands.
+- Implemented the SFT training pipeline (`train.py`) with dual backend support (Unsloth and Transformers) and LoRA/QLoRA configuration.
+- Created typed YAML config system (`config.py`) and Pydantic data schemas (`schemas.py`) for dataset validation.
+- Added LoRA adapter merge stage (`merge.py`) supporting Unsloth and PEFT backends.
+- Built local inference (`generation.py`, `infer.py`) and benchmark orchestration (`benchmark.py`) with oracle, predictions, and transformers modes.
+- Implemented prediction scoring logic (`evaluate.py`) with per-category accuracy reporting (decision, tool names, arguments, content matching).
+- Created a deterministic local tool registry (`tool_registry.py`) with math and inventory functions for reproducible benchmarks.
+- Designed the chat-style JSONL data format with four categories: `no_tool`, `single_tool`, `multi_tool`, `reasoning_tool`.
+- Authored sample training data (`finetune_sample.jsonl` -- 6 examples) and benchmark data (`benchmark_sample.jsonl` -- 4 examples).
+- Wrote dataset validation with structural (Pydantic) and semantic checks (duplicate IDs, category-tool consistency, tool reference integrity).
+- Ran CPU smoke test with `tiny-gpt2` (full finetuning, 1 step) -- passed.
+- Ran GPU smoke test with `Qwen2.5-Coder-1.5B-Instruct` via Unsloth (LoRA, 1 step) -- passed.
+- Ran oracle benchmark -- 100% accuracy across all categories.
+
+### 2026-03-11 -- Shared learning resources
+
+- Added `resources/shared.md` -- a curated resource guide for the team covering fine-tuning fundamentals, core concepts (quantization, tool calling), a key terms glossary, training category explanations, and a recommended learning path.
