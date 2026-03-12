@@ -36,20 +36,23 @@ def build_generation_pipeline(
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             device_map=device_map,
-            torch_dtype=model_dtype,
+            dtype=model_dtype,
             trust_remote_code=True,
         )
     else:
         from peft import PeftModel
 
         base_ref = base_model_name or model_path
-        tokenizer_ref = base_ref
+        tokenizer_ref = str(adapter_path)
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=True)
         base_model = AutoModelForCausalLM.from_pretrained(
             base_ref,
             device_map=device_map,
-            torch_dtype=model_dtype,
+            dtype=model_dtype,
             trust_remote_code=True,
         )
+        if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
+            base_model.resize_token_embeddings(len(tokenizer))
         model = PeftModel.from_pretrained(base_model, str(adapter_path))
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=True)

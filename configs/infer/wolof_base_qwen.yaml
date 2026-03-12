@@ -1,0 +1,12 @@
+model_path: Qwen/Qwen2.5-0.5B-Instruct
+device_map: auto
+dtype: bfloat16
+prompt: Naka nga def?
+system_prompt: You are a helpful assistant for Wolof language tasks. Reply in Wolof unless the user asks otherwise.
+tool_registry: none
+tools: []
+generation:
+  max_new_tokens: 128
+  do_sample: false
+  temperature: 0.0
+  top_p: 1.0

@@ -12,7 +12,32 @@ uv run galsenai data validate data/samples/finetune_sample.jsonl
 uv run galsenai train --config configs/train/sample_qwen_tool_calling.yaml
 uv run galsenai merge --config configs/merge/sample_merge.yaml
 uv run galsenai benchmark run --config configs/benchmark/sample_benchmark.yaml
+uv run galsenai wolof infer --prompt "Nanga def?"
+uv run galsenai wolof run --dataset-file data/wolof-dataset/curated_dataset.json
 ```
+
+## Wolof End-to-End Run
+
+For the Wolof pipeline, `uv sync` plus a single command is enough to run the
+tokenizer benchmark and the follow-up fine-tuning job:
+
+```bash
+uv sync --extra train --extra dev
+uv run galsenai wolof run --dataset-file data/wolof-dataset/curated_dataset.json
+```
+
+The command always runs both stages:
+
+- Step 1 benchmark on 1,000 sampled conversations with Method A vs Method B.
+- Step 2 fine-tuning on 5,000 sampled conversations using the winning tokenizer.
+- Markdown logging, tokenizer artifacts, checkpoints, validation loss, and sample generations under `outputs/wolof/<run-id>/`.
+- Full local and H100 run instructions: `resources/wolof_run_guide.md`
+
+On an H100-class GPU the pipeline now auto-switches to:
+
+- BF16 full fine-tuning.
+- Packed sequences for the benchmark and final run.
+- Much larger per-device batch sizes tuned for the short Wolof conversations in this dataset.
 
 ## Project layout
 
@@ -39,6 +64,7 @@ The codebase is intentionally split by responsibility so maintainers can change 
 - `src/galsenai_llm/infer.py`: Single-prompt inference flow built on top of `generation.py`.
 - `src/galsenai_llm/evaluate.py`: Prediction scoring logic against the benchmark dataset.
 - `src/galsenai_llm/benchmark.py`: Benchmark orchestration. It can score an existing predictions file, run oracle mode, or generate first-turn predictions with a local model.
+- `src/galsenai_llm/wolof_pipeline.py`: End-to-end Wolof tokenizer benchmarking and low-resource fine-tuning pipeline for Qwen 2.5 0.5B.
 - `src/galsenai_llm/tool_registry.py`: Deterministic local reference tools used by the sample datasets and benchmarks.
 
 ### Maintainer notes

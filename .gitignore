@@ -137,10 +137,22 @@ checkpoints/
 *.bin
 *.pt
 *.pth
+*.ckpt
+*.onnx
+*.gguf
 celerybeat.pid
 ---
-outputs/smoke-tiny-gpt2/
-outputs/smoke-unsloth-qwen-tool-calling/
+
+# Generated local experiment outputs
+outputs/*
+!outputs/benchmark/
+!outputs/benchmark/**
+!outputs/eval/
+!outputs/eval/**
+
+# Local Wolof datasets
+data/wolof-dataset/
+
 # SageMath parsed files
 *.sage.py
 
