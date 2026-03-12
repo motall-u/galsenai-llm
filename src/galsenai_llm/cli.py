@@ -103,7 +103,11 @@ def benchmark_run(config: Path = typer.Option(..., "--config", exists=True, read
 @wolof_app.command("infer")
 def wolof_infer(
     prompt: str = typer.Option(..., "--prompt"),
-    model_path: str = typer.Option("Qwen/Qwen2.5-0.5B-Instruct", "--model-path"),
+    model_path: str = typer.Option(
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "--model-path",
+        help="Local model directory or Hugging Face repo id.",
+    ),
     adapter_path: Path | None = typer.Option(None, "--adapter-path"),
     base_model_name: str | None = typer.Option(None, "--base-model-name"),
     system_prompt: str | None = typer.Option(
@@ -136,6 +140,47 @@ def wolof_infer(
             temperature=temperature,
             top_p=top_p,
         )
+    )
+
+
+@wolof_app.command("chat")
+def wolof_chat(
+    model_path: str = typer.Option(
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "--model-path",
+        help="Local model directory or Hugging Face repo id.",
+    ),
+    adapter_path: Path | None = typer.Option(None, "--adapter-path"),
+    base_model_name: str | None = typer.Option(None, "--base-model-name"),
+    system_prompt: str | None = typer.Option(
+        (
+            "You are a helpful assistant for Wolof language tasks. "
+            "Reply in Wolof unless the user asks otherwise."
+        ),
+        "--system-prompt",
+    ),
+    device_map: str = typer.Option("auto", "--device-map"),
+    dtype: str | None = typer.Option("bfloat16", "--dtype"),
+    max_new_tokens: int = typer.Option(128, "--max-new-tokens"),
+    do_sample: bool = typer.Option(False, "--do-sample"),
+    temperature: float = typer.Option(0.0, "--temperature"),
+    top_p: float = typer.Option(1.0, "--top-p"),
+    max_turns: int = typer.Option(0, "--max-turns"),
+) -> None:
+    from .infer import run_chat_session
+
+    run_chat_session(
+        model_path=model_path,
+        adapter_path=None if adapter_path is None else str(adapter_path),
+        base_model_name=base_model_name,
+        device_map=device_map,
+        dtype=dtype,
+        system_prompt=system_prompt,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        max_turns=max_turns,
     )
 
 
@@ -173,6 +218,55 @@ def wolof_run(
             benchmark_epochs=benchmark_epochs,
             full_epochs=full_epochs,
             seed=seed,
+        )
+    )
+
+
+@wolof_app.command("upload")
+def wolof_upload(
+    run_dir: Path = typer.Option(..., "--run-dir", exists=True, file_okay=False, readable=True),
+    repo_id: str = typer.Option(..., "--repo-id"),
+    token: str | None = typer.Option(None, "--token"),
+    private: bool = typer.Option(False, "--private/--public"),
+    commit_message: str | None = typer.Option(None, "--commit-message"),
+    include_benchmark: bool = typer.Option(True, "--include-benchmark/--no-benchmark"),
+    include_report: bool = typer.Option(False, "--include-report/--no-report"),
+    include_sample_generations: bool = typer.Option(
+        False,
+        "--include-sample-generations/--no-sample-generations",
+    ),
+) -> None:
+    from .wolof_hub import upload_wolof_run_to_hub
+
+    _print_report(
+        upload_wolof_run_to_hub(
+            run_dir=run_dir,
+            repo_id=repo_id,
+            token=token,
+            private=private,
+            commit_message=commit_message,
+            include_benchmark=include_benchmark,
+            include_report=include_report,
+            include_sample_generations=include_sample_generations,
+        )
+    )
+
+
+@wolof_app.command("download")
+def wolof_download(
+    repo_id: str = typer.Option(..., "--repo-id"),
+    local_dir: Path | None = typer.Option(None, "--local-dir"),
+    revision: str | None = typer.Option(None, "--revision"),
+    token: str | None = typer.Option(None, "--token"),
+) -> None:
+    from .wolof_hub import download_wolof_repo_from_hub
+
+    _print_report(
+        download_wolof_repo_from_hub(
+            repo_id=repo_id,
+            local_dir=local_dir,
+            revision=revision,
+            token=token,
         )
     )
 

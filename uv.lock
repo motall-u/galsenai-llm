@@ -626,6 +626,7 @@ name = "galsenai-llm"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "rich" },
@@ -655,6 +656,7 @@ requires-dist = [
     { name = "accelerate", marker = "extra == 'train'", specifier = ">=1.2.1" },
     { name = "bitsandbytes", marker = "extra == 'train'", specifier = ">=0.49.2" },
     { name = "datasets", marker = "extra == 'train'", specifier = ">=3.2.0" },
+    { name = "huggingface-hub", specifier = ">=0.34.4" },
     { name = "peft", marker = "extra == 'train'", specifier = ">=0.13.2" },
     { name = "pydantic", specifier = ">=2.9.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.3.4" },

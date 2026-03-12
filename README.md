@@ -26,12 +26,18 @@ uv sync --extra train --extra dev
 uv run galsenai wolof run --dataset-file data/wolof-dataset/curated_dataset.json
 ```
 
+After a run completes, publish it with:
+
+```bash
+uv run galsenai wolof upload --run-dir outputs/wolof/<run-id> --repo-id your-username/your-wolof-model
+```
+
 The command always runs both stages:
 
 - Step 1 benchmark on 1,000 sampled conversations with Method A vs Method B.
 - Step 2 fine-tuning on 5,000 sampled conversations using the winning tokenizer.
 - Markdown logging, tokenizer artifacts, checkpoints, validation loss, and sample generations under `outputs/wolof/<run-id>/`.
-- Full local and H100 run instructions: `resources/wolof_run_guide.md`
+- Upload, download, CLI inference, interactive chat, and full run guide: `resources/wolof_run_guide.md`
 
 On an H100-class GPU the pipeline now auto-switches to:
 

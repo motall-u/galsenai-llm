@@ -21,6 +21,23 @@ def resolve_torch_dtype(dtype_name: str | None) -> Any:
     return getattr(torch, dtype_name)
 
 
+def _detect_peft_base_model(reference: str | Path) -> str | None:
+    try:
+        from peft import PeftConfig
+    except ImportError:
+        return None
+
+    try:
+        config = PeftConfig.from_pretrained(str(reference))
+    except Exception:
+        return None
+
+    base_model_name = getattr(config, "base_model_name_or_path", None)
+    if isinstance(base_model_name, str) and base_model_name.strip():
+        return base_model_name.strip()
+    return None
+
+
 def build_generation_pipeline(
     *,
     model_path: str,
@@ -31,35 +48,76 @@ def build_generation_pipeline(
 ) -> Any:
     model_dtype = resolve_torch_dtype(dtype)
     tokenizer_ref = model_path
+    resolved_base_model_name = base_model_name
+    adapter_ref: str | None = None
+    is_adapter_model = False
 
     if adapter_path is None:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            device_map=device_map,
-            dtype=model_dtype,
-            trust_remote_code=True,
-        )
+        inferred_base_model_name = _detect_peft_base_model(model_path)
+        if inferred_base_model_name is None:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                device_map=device_map,
+                dtype=model_dtype,
+                trust_remote_code=True,
+            )
+        else:
+            from peft import PeftModel
+
+            is_adapter_model = True
+            adapter_ref = model_path
+            tokenizer_ref = model_path
+            resolved_base_model_name = resolved_base_model_name or inferred_base_model_name
+            if not resolved_base_model_name:
+                raise ValueError(
+                    "Could not determine the base model for the adapter repository."
+                )
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=True)
+            base_model = AutoModelForCausalLM.from_pretrained(
+                resolved_base_model_name,
+                device_map=device_map,
+                dtype=model_dtype,
+                trust_remote_code=True,
+            )
+            if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
+                base_model.resize_token_embeddings(len(tokenizer))
+            model = PeftModel.from_pretrained(base_model, adapter_ref)
     else:
         from peft import PeftModel
 
-        base_ref = base_model_name or model_path
-        tokenizer_ref = str(adapter_path)
+        is_adapter_model = True
+        adapter_ref = str(adapter_path)
+        tokenizer_ref = adapter_ref
+        inferred_base_model_name = _detect_peft_base_model(adapter_ref)
+        resolved_base_model_name = resolved_base_model_name or inferred_base_model_name
+        if not resolved_base_model_name:
+            raise ValueError(
+                "Adapter loading requires --base-model-name or a valid adapter_config.json."
+            )
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=True)
         base_model = AutoModelForCausalLM.from_pretrained(
-            base_ref,
+            resolved_base_model_name,
             device_map=device_map,
             dtype=model_dtype,
             trust_remote_code=True,
         )
         if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
             base_model.resize_token_embeddings(len(tokenizer))
-        model = PeftModel.from_pretrained(base_model, str(adapter_path))
+        model = PeftModel.from_pretrained(base_model, adapter_ref)
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=True)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    return pipeline("text-generation", model=model, tokenizer=tokenizer)
+    pipe = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    pipe._galsenai_model_info = {
+        "model_path": model_path,
+        "adapter_path": adapter_ref,
+        "base_model_name": resolved_base_model_name,
+        "is_adapter_model": is_adapter_model,
+        "tokenizer_ref": tokenizer_ref,
+    }
+    return pipe
 
 
 def message_to_chat_dict(message: Message) -> dict[str, Any]:

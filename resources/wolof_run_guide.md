@@ -1,17 +1,19 @@
 # Wolof Run Guide
 
-This guide covers the two supported execution paths for the Wolof pipeline:
+This guide covers the full Wolof execution workflow for:
 
 - local development on a smaller GPU such as an 8 GB laptop GPU
-- production-style execution on an H100-class GPU
+- production-style runs on an H100-class GPU
+- full-dataset execution after the tokenizer benchmark
 
 The pipeline is CLI-first and runs end to end:
 
 1. detect the GPU with `nvidia-smi`
-2. benchmark two tokenizer adaptation methods on 1,000 sampled conversations
+2. benchmark two tokenizer adaptation methods on a sampled benchmark split
 3. pick the winning tokenizer
-4. fine-tune on 5,000 sampled conversations
-5. save checkpoints, metrics, generations, and a Markdown report
+4. rebuild the winning tokenizer on the final training pool
+5. fine-tune Qwen 2.5 0.5B on the selected training pool
+6. save checkpoints, metrics, generations, and a Markdown report
 
 ## Dataset
 
@@ -23,15 +25,39 @@ data/wolof-dataset/curated_dataset.json
 
 The file must contain the full conversation list used by the Wolof pipeline.
 
+## Important Flags
+
+These are the two flags that matter most when you run the pipeline:
+
+- `--benchmark-samples`: number of conversations used for the tokenizer benchmark
+- `--full-samples`: size of the final fine-tuning pool after the benchmark
+
+Important: `--full-samples` is not "use the whole dataset automatically". It is the exact size of the final training pool you want.
+
+Defaults:
+
+- benchmark sample size: `1000`
+- full fine-tuning sample size: `5000`
+- benchmark epochs: `3`
+- full fine-tuning epochs: `3`
+
 ## Install
 
-Run this once on either local or H100:
+Run this once from the repo root:
 
 ```bash
 uv sync --extra train --extra dev
 ```
 
-## Sanity Check Before Training
+The Wolof pipeline depends on the `train` extra. Do not rely on `uv pip install torch` alone.
+
+If you want to confirm the project environment is complete, run:
+
+```bash
+uv run python -c "import torch, datasets, peft, transformers, trl; print(torch.__version__)"
+```
+
+## Pre-Flight Check
 
 Confirm the GPU and driver:
 
@@ -76,9 +102,20 @@ uv run galsenai wolof run \
 
 ### Default local end-to-end run
 
+This runs the benchmark on `1000` samples and the final fine-tune on `5000` samples:
+
 ```bash
 uv run galsenai wolof run \
-  --dataset-file data/wolof-dataset/curated_dataset.json
+  --dataset-file data/wolof-dataset/curated_dataset.json \
+  --output-dir outputs/wolof-local
+```
+
+After training finishes, upload that run with:
+
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof-local/<run-id> \
+  --repo-id your-username/your-wolof-model
 ```
 
 ### Expected local profile
@@ -114,7 +151,9 @@ The current H100 auto-plan is:
 - max length cap: `512`
 - packing: `True`
 
-### H100 end-to-end run
+### H100 default end-to-end run
+
+This runs the benchmark on `1000` samples and the final fine-tune on `5000` samples:
 
 ```bash
 uv run galsenai wolof run \
@@ -122,9 +161,17 @@ uv run galsenai wolof run \
   --output-dir outputs/wolof-h100
 ```
 
-### Optional H100 larger run
+After training finishes, upload that run with:
 
-If you want to go beyond the default 5,000-sample fine-tuning stage, increase the sample sizes explicitly:
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof-h100/<run-id> \
+  --repo-id your-username/your-wolof-model
+```
+
+### H100 larger subset run
+
+If you want a larger final training pool but not the full dataset:
 
 ```bash
 uv run galsenai wolof run \
@@ -136,15 +183,104 @@ uv run galsenai wolof run \
   --output-dir outputs/wolof-h100-large
 ```
 
-Use that only if you intentionally want a larger training subset than the default workflow.
+After training finishes, upload that run with:
+
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof-h100-large/<run-id> \
+  --repo-id your-username/your-wolof-model
+```
+
+## Full-Dataset Run
+
+The current dataset contains `133442` usable conversations when loaded by the pipeline.
+
+If you want to verify that number on your machine, run:
+
+```bash
+uv run python - <<'PY'
+from pathlib import Path
+from galsenai_llm.wolof_pipeline import load_wolof_dataset
+
+records = load_wolof_dataset(Path("data/wolof-dataset/curated_dataset.json"))
+print(len(records))
+PY
+```
+
+### Recommended full-dataset run without overlap
+
+This is the recommended command. It uses:
+
+- `1000` conversations for the tokenizer benchmark
+- the remaining `132442` conversations for the final fine-tune
+
+```bash
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset.json \
+  --benchmark-samples 1000 \
+  --full-samples 132442 \
+  --benchmark-epochs 3 \
+  --full-epochs 3 \
+  --output-dir outputs/wolof-full-all
+```
+
+After training finishes, upload that run with:
+
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof-full-all/<run-id> \
+  --repo-id your-username/your-wolof-model \
+  --include-benchmark \
+  --include-report \
+  --include-sample-generations
+```
+
+Why `132442` instead of `133442`:
+
+- total usable conversations: `133442`
+- benchmark sample: `1000`
+- final no-overlap training pool: `133442 - 1000 = 132442`
+
+### Full-dataset run with overlap
+
+Use this only if you intentionally want the benchmark conversations to be eligible for the final training pool too:
+
+```bash
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset.json \
+  --benchmark-samples 1000 \
+  --full-samples 133442 \
+  --benchmark-epochs 3 \
+  --full-epochs 3 \
+  --output-dir outputs/wolof-full-all-overlap
+```
+
+After training finishes, upload that run with:
+
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof-full-all-overlap/<run-id> \
+  --repo-id your-username/your-wolof-model \
+  --include-benchmark \
+  --include-report \
+  --include-sample-generations
+```
+
+This is usually not the preferred setup because the final training pool can include the benchmark conversations.
 
 ## Artifacts
 
-Each run writes a timestamped directory:
+Each run writes a timestamped directory under the output root you pass with `--output-dir`:
 
 ```text
-outputs/wolof/<run-id>/
+<output-dir>/<run-id>/
 ```
+
+Examples:
+
+- `outputs/wolof-local/<run-id>/`
+- `outputs/wolof-h100/<run-id>/`
+- `outputs/wolof-full-all/<run-id>/`
 
 Important files:
 
@@ -155,14 +291,60 @@ Important files:
 - `final/final_result.json`: final validation metrics and selected tokenizer
 - `final/sample_generations.json`: generated Wolof samples
 - `final/model/`: trainer checkpoint output
+- `run_summary.json`: compact machine-readable run summary
 - `wolof_finetuning_report.md`: human-readable summary of the whole run
+
+## Publish To Hugging Face
+
+After training finishes, upload the final model plus benchmark artifacts with:
+
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof-full-all/<run-id> \
+  --repo-id your-username/your-wolof-model
+```
+
+Useful optional flags:
+
+- `--private` to create a private model repo
+- `--include-benchmark` to upload the tokenizer benchmark results
+- `--include-report` if you also want to upload the Markdown report
+- `--include-sample-generations` if you want to upload generated validation samples
+
+Default behavior:
+
+- uploads the final model files to the repository root
+- uploads benchmark artifacts under `benchmark/`
+- uploads compact run metadata under `artifacts/`
+- generates a cleaner `README.md` model card than the default trainer output
+
+Authentication:
+
+- pass `--token <hf_token>`
+- or set `HF_TOKEN`
+
+## Download From Hugging Face
+
+Download a previously uploaded model repository locally:
+
+```bash
+uv run galsenai wolof download \
+  --repo-id your-username/your-wolof-model \
+  --local-dir models/your-wolof-model
+```
+
+If you omit `--local-dir`, the default is:
+
+```text
+models/<repo-id-with-slashes-replaced-by-->
+```
 
 ## How To Read The Report
 
 Open:
 
 ```text
-outputs/wolof/<run-id>/wolof_finetuning_report.md
+<output-dir>/<run-id>/wolof_finetuning_report.md
 ```
 
 Check these sections first:
@@ -173,7 +355,91 @@ Check these sections first:
 - `Full Fine-Tuning`: contains final validation loss and perplexity
 - `Sample Generations`: qualitative Wolof outputs
 
-## Typical Workflow
+## Inference From Hugging Face Or A Downloaded Model
+
+The inference commands accept either:
+
+- a Hugging Face repo id such as `your-username/your-wolof-model`
+- or a downloaded local directory such as `models/your-wolof-model`
+
+### One-shot CLI inference
+
+Directly from the Hub:
+
+```bash
+uv run galsenai wolof infer \
+  --model-path your-username/your-wolof-model \
+  --prompt "Nanga def?"
+```
+
+From a downloaded local directory:
+
+```bash
+uv run galsenai wolof infer \
+  --model-path models/your-wolof-model \
+  --prompt "Nanga def?"
+```
+
+### Interactive chat mode
+
+Directly from the Hub:
+
+```bash
+uv run galsenai wolof chat --model-path your-username/your-wolof-model
+```
+
+From a downloaded local directory:
+
+```bash
+uv run galsenai wolof chat --model-path models/your-wolof-model
+```
+
+Notes:
+
+- if the uploaded repository is a PEFT adapter repo, the loader will read `adapter_config.json` and load the base model automatically
+- use `/clear` to reset the chat history
+- use `/exit` or `/quit` to leave chat mode
+
+## Troubleshooting
+
+### `ModuleNotFoundError: No module named 'torch'`
+
+This usually means `uv run` is not using an environment that has the `train` extra installed.
+
+Fix:
+
+```bash
+uv sync --extra train --extra dev
+```
+
+Then verify:
+
+```bash
+uv run python -c "import torch, datasets, peft, transformers, trl; print(torch.__version__)"
+```
+
+Do not rely on `uv pip install torch` by itself.
+
+### OOM or CUDA memory error
+
+The pipeline already retries with a reduced training plan. If you still hit OOM:
+
+- reduce `--full-samples` for the first test
+- reduce epochs for the first validation run
+- use the local smoke command before launching a large run
+
+### Run restarts after failure
+
+Each invocation creates a new timestamped output directory. The pipeline does not currently resume from a previous run directory automatically.
+
+### Hugging Face authentication errors
+
+If upload or download fails because of authentication:
+
+- set `HF_TOKEN` in the shell
+- or pass `--token` explicitly to `wolof upload` or `wolof download`
+
+## Typical Workflows
 
 ### Local development
 
@@ -181,19 +447,29 @@ Check these sections first:
 2. `nvidia-smi`
 3. `uv run galsenai wolof infer --prompt "Nanga def?"`
 4. run the local smoke test
-5. run the default local end-to-end command if the smoke test succeeds
+5. run the default local command if the smoke test succeeds
 
-### H100 execution
+### H100 default workflow
 
 1. `uv sync --extra train --extra dev`
 2. `nvidia-smi`
 3. `uv run galsenai wolof infer --prompt "Nanga def?"`
-4. run the H100 end-to-end command
+4. run the H100 default end-to-end command
 5. inspect `wolof_finetuning_report.md`
+6. upload with `uv run galsenai wolof upload --run-dir ... --repo-id ...`
+
+### H100 full-dataset workflow
+
+1. `uv sync --extra train --extra dev`
+2. `nvidia-smi`
+3. optionally verify the usable conversation count
+4. run the recommended full-dataset no-overlap command
+5. inspect `run_summary.json` and `wolof_finetuning_report.md`
+6. upload with `uv run galsenai wolof upload --run-dir ... --repo-id ...`
+7. verify with `uv run galsenai wolof infer --model-path your-username/your-wolof-model --prompt "Nanga def?"`
 
 ## Notes
 
-- The default workflow is not the entire 133k conversation dataset. It benchmarks on 1,000 samples and fine-tunes on 5,000 samples.
+- The default workflow is not the entire 133k conversation dataset. It benchmarks on `1000` samples and fine-tunes on `5000` samples.
 - The pipeline is designed to adapt itself to the detected GPU. You do not need separate code paths for local and H100.
-- If a training run fails with OOM, the pipeline will automatically retry with a reduced plan.
 - The research rationale for the tokenizer and low-resource choices is documented in `resources/wolof_low_resource_strategy.md`.
