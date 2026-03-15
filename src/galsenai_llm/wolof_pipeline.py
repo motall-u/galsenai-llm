@@ -36,6 +36,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    EarlyStoppingCallback,
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
     set_seed,
@@ -125,6 +126,14 @@ class TrainingPlan:
     lora_alpha: int
     lora_dropout: float
     max_new_tokens: int
+    seed: int
+    data_seed: int
+    train_sampling_strategy: str
+    load_best_model_at_end: bool
+    metric_for_best_model: str | None
+    greater_is_better: bool | None
+    early_stopping_patience: int | None
+    early_stopping_threshold: float
 
 
 @dataclass(slots=True)
@@ -299,6 +308,7 @@ def _build_training_plan(
     train_size: int,
     num_train_epochs: int,
     max_length: int,
+    seed: int,
 ) -> TrainingPlan:
     batch_size = profile.benchmark_batch_size if benchmark else profile.full_batch_size
     eval_batch_size = (
@@ -311,7 +321,7 @@ def _build_training_plan(
     steps_per_epoch = max(1, math.ceil(train_size / max(1, batch_size * grad_accum)))
     total_steps = max(1, steps_per_epoch * num_train_epochs)
     logging_steps = max(1, total_steps // 12)
-    warmup_steps = max(1, int(total_steps * 0.03))
+    warmup_steps = max(1, int(total_steps * 0.05))
     return TrainingPlan(
         strategy=profile.training_strategy,
         load_in_4bit=profile.training_strategy == "qlora" and torch.cuda.is_available(),
@@ -334,6 +344,14 @@ def _build_training_plan(
         lora_alpha=32,
         lora_dropout=0.05,
         max_new_tokens=96,
+        seed=seed,
+        data_seed=seed,
+        train_sampling_strategy="random",
+        load_best_model_at_end=not benchmark,
+        metric_for_best_model=None if benchmark else "eval_loss",
+        greater_is_better=None if benchmark else False,
+        early_stopping_patience=None if benchmark else 1,
+        early_stopping_threshold=0.0,
     )
 
 
@@ -2264,7 +2282,8 @@ def _train_once(
         plan=plan,
     )
 
-    train_dataset = _rendered_dataset(train_records, adaptation.tokenizer)
+    shuffled_train_records = shuffle_records(train_records, seed=plan.data_seed)
+    train_dataset = _rendered_dataset(shuffled_train_records, adaptation.tokenizer)
     eval_dataset = _rendered_dataset(eval_records, adaptation.tokenizer)
 
     trainer_output_dir = output_dir / "model"
@@ -2292,13 +2311,28 @@ def _train_once(
         report_to=[],
         bf16=plan.bf16,
         fp16=plan.fp16,
+        seed=plan.seed,
+        data_seed=plan.data_seed,
+        train_sampling_strategy=plan.train_sampling_strategy,
+        load_best_model_at_end=plan.load_best_model_at_end,
+        metric_for_best_model=plan.metric_for_best_model,
+        greater_is_better=plan.greater_is_better,
     )
+    callbacks = []
+    if plan.early_stopping_patience is not None:
+        callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=plan.early_stopping_patience,
+                early_stopping_threshold=plan.early_stopping_threshold,
+            )
+        )
     trainer = SFTTrainer(
         model=model,
         processing_class=adaptation.tokenizer,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         args=sft_config,
+        callbacks=callbacks,
     )
 
     train_result = trainer.train()
@@ -2328,6 +2362,11 @@ def _train_once(
         "embedding_similarity_by_token_id": similarity_scores,
         "sample_generations": sample_generations,
         "epoch_checkpoints": epoch_checkpoint_summary,
+        "best_model_checkpoint": trainer.state.best_model_checkpoint,
+        "train_shuffle_seed": plan.data_seed,
+        "train_preview_conversation_ids": [
+            record.conversation_id for record in shuffled_train_records[:5]
+        ],
     }
     _write_json_payload(output_dir / "training_summary.json", train_summary)
     return train_summary
@@ -2477,6 +2516,7 @@ def _benchmark_method(
     bpe_vocab_size: int,
     epochs: int,
     output_dir: Path,
+    seed: int,
 ) -> dict[str, Any]:
     train_records = benchmark_splits["train"]
     val_records = benchmark_splits["val"]
@@ -2518,6 +2558,7 @@ def _benchmark_method(
         train_size=len(train_records),
         num_train_epochs=epochs,
         max_length=suggested_length,
+        seed=seed,
     )
 
     held_out_texts = _assistant_texts(test_records)
@@ -3106,6 +3147,7 @@ def run_wolof_pipeline(
             bpe_vocab_size=benchmark_bpe_vocab_size,
             epochs=benchmark_epochs,
             output_dir=method_dir,
+            seed=seed + 31,
         )
         benchmark_results.append(result)
         _cleanup_cuda()
@@ -3153,6 +3195,7 @@ def run_wolof_pipeline(
         train_size=len(final_train_records),
         num_train_epochs=full_epochs,
         max_length=final_max_length,
+        seed=seed + 141,
     )
 
     final_train_summary = train_with_fallback(

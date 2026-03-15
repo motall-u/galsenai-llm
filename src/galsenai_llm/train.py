@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from typing import Any
 
 import torch
@@ -141,6 +142,28 @@ def _load_model_and_tokenizer(config: TrainProjectConfig):
     return model, tokenizer
 
 
+def _supports_assistant_only_loss(tokenizer) -> bool:
+    if not hasattr(tokenizer, "apply_chat_template"):
+        return False
+    try:
+        probe = tokenizer.apply_chat_template(
+            [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi"},
+            ],
+            tokenize=True,
+            return_dict=True,
+            return_assistant_tokens_mask=True,
+        )
+    except Exception:
+        return False
+    assistant_masks = probe.get("assistant_masks")
+    if assistant_masks is None:
+        return False
+    return sum(int(mask) for mask in assistant_masks) > 0
+
+
 def run_train(config: TrainProjectConfig) -> dict[str, Any]:
     if config.data.train_file is None:
         raise ValueError("Training requires data.train_file in the YAML config.")
@@ -152,8 +175,15 @@ def run_train(config: TrainProjectConfig) -> dict[str, Any]:
     eval_examples = load_examples(config.data.eval_file) if config.data.eval_file else None
 
     set_seed(config.training.seed)
+    shuffled_train_examples = list(train_examples)
+    random.Random(config.training.seed).shuffle(shuffled_train_examples)
     model, tokenizer = _load_model_and_tokenizer(config)
-    train_dataset = Dataset.from_list(_rendered_records(train_examples, tokenizer))
+    if config.training.assistant_only_loss and not _supports_assistant_only_loss(tokenizer):
+        raise ValueError(
+            "assistant_only_loss=True requires a chat template that returns a non-empty "
+            "assistant token mask. The current tokenizer does not expose one."
+        )
+    train_dataset = Dataset.from_list(_rendered_records(shuffled_train_examples, tokenizer))
     eval_dataset = (
         Dataset.from_list(_rendered_records(eval_examples, tokenizer))
         if eval_examples
@@ -179,6 +209,9 @@ def run_train(config: TrainProjectConfig) -> dict[str, Any]:
         "max_length": config.training.max_length or config.model.max_seq_length,
         "dataset_text_field": "text",
         "report_to": config.training.report_to,
+        "seed": config.training.seed,
+        "data_seed": config.training.seed,
+        "train_sampling_strategy": "random",
     }
     if getattr(tokenizer, "eos_token", None):
         sft_kwargs["eos_token"] = tokenizer.eos_token
@@ -203,6 +236,7 @@ def run_train(config: TrainProjectConfig) -> dict[str, Any]:
         "eval_examples": len(eval_examples) if eval_examples else 0,
         "output_dir": str(config.training.output_dir),
         "train_metrics": train_result.metrics,
+        "train_shuffle_seed": config.training.seed,
     }
     if eval_dataset is not None:
         summary["eval_metrics"] = trainer.evaluate()

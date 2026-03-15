@@ -71,6 +71,8 @@ Use this for single-prompt inference. It accepts:
 Common flags:
 - `--model-path`: local path or HF repo id
 - `--prompt`: prompt text
+- `--merge`: merge a PEFT adapter into the base model in memory before generation
+- `--merge-dtype`: dtype used for the in-memory merge, for example `float16`
 - `--system-prompt`: override the default multilingual assistant prompt
 - `--max-new-tokens`
 - `--do-sample`, `--temperature`, `--top-p`
@@ -84,7 +86,18 @@ uv run galsenai wolof infer \
   --model-path Qwen/Qwen2.5-0.5B-Instruct \
   --adapter-path outputs/wolof/<run-id>/final/model \
   --prompt "Tekkil ci Wolof: Hello my friend."
+uv run galsenai wolof infer \
+  --model-path your-username/your-wolof-adapter \
+  --merge \
+  --merge-dtype float16 \
+  --prompt "Who is Sadio Mane?"
 ```
+
+Notes:
+- If `--model-path` points to an adapter repo, the CLI can infer from the adapter directly.
+- If you add `--merge`, the adapter is merged into the base model in memory before inference.
+- `--merge` is useful when you want merged-model behavior without saving a separate merged checkpoint.
+- `--merge` matters only for adapter loading; on a full model repo or full local model, inference runs normally without a merge step.
 
 ### `galsenai wolof chat`
 
@@ -93,6 +106,8 @@ Interactive chat mode for the same model sources as `wolof infer`.
 Useful flags:
 - `--model-path`
 - `--adapter-path`
+- `--merge`
+- `--merge-dtype`
 - `--system-prompt`
 - `--max-new-tokens`
 - `--max-turns`
@@ -104,6 +119,10 @@ uv run galsenai wolof chat --model-path your-username/your-wolof-model
 uv run galsenai wolof chat \
   --model-path Qwen/Qwen2.5-0.5B-Instruct \
   --adapter-path outputs/wolof/<run-id>/final/model
+uv run galsenai wolof chat \
+  --model-path your-username/your-wolof-adapter \
+  --merge \
+  --merge-dtype float16
 ```
 
 ### `galsenai wolof run`
@@ -165,6 +184,13 @@ Method A specifics:
 - initializes new embeddings by averaging source subtoken embeddings
 - runs a round-trip tokenizer audit and writes it into `benchmark/method_a/token_selection.json`
 
+Training behavior:
+- the train split is shuffled deterministically from the run seed before SFT dataset creation
+- if English/math replay is enabled, the mixed train set is shuffled again after mixing
+- the final fine-tuning stage tracks `eval_loss`, saves checkpoints every epoch, and reloads the best checkpoint at the end
+- the final stage uses early stopping with patience `1`
+- the Wolof pipeline keeps `assistant_only_loss=False` because the current Qwen chat template does not expose a reliable assistant mask in this setup
+
 ### `galsenai wolof benchmark`
 
 This command runs the Wolof AfroBench suite through the TRC `lm-evaluation-harness`
@@ -210,6 +236,13 @@ uv run galsenai wolof benchmark \
 Uploads a completed Wolof run to Hugging Face. By default it uploads `final/model`.
 You can also upload a specific saved epoch checkpoint.
 
+Upload behavior:
+- if `final/model` is a PEFT adapter directory, the upload publishes the adapter
+- if `final/model` is a full fine-tuned Transformers model, the upload publishes the full model
+- after uploading an adapter repo, you can either infer from the adapter directly or add `--merge` during inference/chat
+- typical local / QLoRA Wolof runs upload an adapter
+- typical high-memory full fine-tuning runs upload a full model
+
 Key flags:
 - `--run-dir`
 - `--repo-id`
@@ -234,6 +267,12 @@ uv run galsenai wolof upload \
   --include-benchmark \
   --include-report \
   --include-sample-generations
+
+uv run galsenai wolof infer \
+  --model-path your-username/your-wolof-model \
+  --merge \
+  --merge-dtype float16 \
+  --prompt "Nanga def?"
 ```
 
 ### `galsenai wolof download`

@@ -117,6 +117,22 @@ def wolof_infer(
     ),
     adapter_path: Path | None = typer.Option(None, "--adapter-path"),
     base_model_name: str | None = typer.Option(None, "--base-model-name"),
+    merge: bool = typer.Option(
+        False,
+        "--merge/--no-merge",
+        help=(
+            "When loading a PEFT adapter, merge it into the base model in memory "
+            "before generation."
+        ),
+    ),
+    merge_dtype: str | None = typer.Option(
+        None,
+        "--merge-dtype",
+        help=(
+            "Optional torch dtype used when loading the base model for an in-memory "
+            "adapter merge, for example float16, bfloat16, or float32."
+        ),
+    ),
     system_prompt: str | None = typer.Option(
         DEFAULT_WOLOF_SYSTEM_PROMPT,
         "--system-prompt",
@@ -138,6 +154,8 @@ def wolof_infer(
             base_model_name=base_model_name,
             device_map=device_map,
             dtype=dtype,
+            merge_adapter=merge,
+            merge_dtype=merge_dtype,
             system_prompt=system_prompt,
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
@@ -156,6 +174,22 @@ def wolof_chat(
     ),
     adapter_path: Path | None = typer.Option(None, "--adapter-path"),
     base_model_name: str | None = typer.Option(None, "--base-model-name"),
+    merge: bool = typer.Option(
+        False,
+        "--merge/--no-merge",
+        help=(
+            "When loading a PEFT adapter, merge it into the base model in memory "
+            "before starting the chat session."
+        ),
+    ),
+    merge_dtype: str | None = typer.Option(
+        None,
+        "--merge-dtype",
+        help=(
+            "Optional torch dtype used when loading the base model for an in-memory "
+            "adapter merge, for example float16, bfloat16, or float32."
+        ),
+    ),
     system_prompt: str | None = typer.Option(
         DEFAULT_WOLOF_SYSTEM_PROMPT,
         "--system-prompt",
@@ -176,6 +210,8 @@ def wolof_chat(
         base_model_name=base_model_name,
         device_map=device_map,
         dtype=dtype,
+        merge_adapter=merge,
+        merge_dtype=merge_dtype,
         system_prompt=system_prompt,
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,

@@ -127,6 +127,16 @@ Run inference directly from the Hub:
 uv run galsenai wolof infer --model-path {repo_id} --prompt "Nanga def?"
 ```
 
+Run inference with an in-memory adapter merge:
+
+```bash
+uv run galsenai wolof infer \\
+  --model-path {repo_id} \\
+  --merge \\
+  --merge-dtype float16 \\
+  --prompt "Nanga def?"
+```
+
 Start an interactive chat session:
 
 ```bash
@@ -149,6 +159,9 @@ uv run galsenai wolof infer --model-path models/{repo_slug} --prompt "Nanga def?
 
 - If this repository contains a PEFT adapter, the CLI loader will read the
   adapter configuration and load the correct base model automatically.
+- For adapter repositories, `--merge --merge-dtype float16` merges the adapter
+  into the base model in memory for inference without exporting a separate
+  merged checkpoint.
 - Benchmark comparison results are stored separately from the model weights
   so you can inspect tokenizer quality without opening the training run
   directory.

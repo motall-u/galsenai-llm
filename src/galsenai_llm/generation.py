@@ -133,12 +133,16 @@ def build_generation_pipeline(
     base_model_name: str | None,
     device_map: str,
     dtype: str | None,
+    merge_adapter: bool = False,
+    merge_dtype: str | None = None,
 ) -> Any:
     model_dtype = resolve_torch_dtype(dtype)
+    merge_model_dtype = resolve_torch_dtype(merge_dtype) if merge_dtype else model_dtype
     tokenizer_ref = model_path
     resolved_base_model_name = base_model_name
     adapter_ref: str | None = None
     is_adapter_model = False
+    merged_adapter = False
 
     with _quiet_transformers_output():
         if adapter_path is None:
@@ -166,11 +170,14 @@ def build_generation_pipeline(
                 base_model = _load_causal_lm(
                     resolved_base_model_name,
                     device_map=device_map,
-                    dtype=model_dtype,
+                    dtype=merge_model_dtype if merge_adapter else model_dtype,
                 )
                 if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
                     base_model.resize_token_embeddings(len(tokenizer))
                 model = PeftModel.from_pretrained(base_model, adapter_ref)
+                if merge_adapter:
+                    model = model.merge_and_unload()
+                    merged_adapter = True
         else:
             from peft import PeftModel
 
@@ -187,11 +194,14 @@ def build_generation_pipeline(
             base_model = _load_causal_lm(
                 resolved_base_model_name,
                 device_map=device_map,
-                dtype=model_dtype,
+                dtype=merge_model_dtype if merge_adapter else model_dtype,
             )
             if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
                 base_model.resize_token_embeddings(len(tokenizer))
             model = PeftModel.from_pretrained(base_model, adapter_ref)
+            if merge_adapter:
+                model = model.merge_and_unload()
+                merged_adapter = True
 
         tokenizer = _load_tokenizer(tokenizer_ref)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
@@ -203,6 +213,8 @@ def build_generation_pipeline(
         "adapter_path": adapter_ref,
         "base_model_name": resolved_base_model_name,
         "is_adapter_model": is_adapter_model,
+        "merged_adapter": merged_adapter,
+        "merge_dtype": merge_dtype if merged_adapter else None,
         "tokenizer_ref": tokenizer_ref,
     }
     return pipe

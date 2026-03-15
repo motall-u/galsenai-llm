@@ -37,6 +37,8 @@ def run_prompt_inference(
     base_model_name: str | None = None,
     device_map: str = "auto",
     dtype: str | None = None,
+    merge_adapter: bool = False,
+    merge_dtype: str | None = None,
     system_prompt: str | None = None,
     max_new_tokens: int = 256,
     do_sample: bool = False,
@@ -58,6 +60,8 @@ def run_prompt_inference(
         base_model_name=base_model_name,
         device_map=device_map,
         dtype=dtype,
+        merge_adapter=merge_adapter,
+        merge_dtype=merge_dtype,
     )
     assistant = generate_first_assistant(
         pipe=pipe,
@@ -77,6 +81,8 @@ def run_prompt_inference(
         "adapter_path": adapter_path,
         "resolved_model": model_info,
         "prompt": prompt,
+        "merge_adapter": merge_adapter,
+        "merge_dtype": merge_dtype if merge_adapter else None,
         "assistant": assistant.model_dump(mode="json", exclude_none=True),
     }
 
@@ -108,6 +114,8 @@ def run_chat_session(
     base_model_name: str | None = None,
     device_map: str = "auto",
     dtype: str | None = None,
+    merge_adapter: bool = False,
+    merge_dtype: str | None = None,
     system_prompt: str | None = None,
     max_new_tokens: int = 256,
     do_sample: bool = False,
@@ -122,6 +130,8 @@ def run_chat_session(
         base_model_name=base_model_name,
         device_map=device_map,
         dtype=dtype,
+        merge_adapter=merge_adapter,
+        merge_dtype=merge_dtype,
     )
 
     history: list[Message] = []
@@ -169,6 +179,8 @@ def run_chat_session(
         "model_path": model_path,
         "adapter_path": adapter_path,
         "resolved_model": getattr(pipe, "_galsenai_model_info", {}),
+        "merge_adapter": merge_adapter,
+        "merge_dtype": merge_dtype if merge_adapter else None,
         "turns": turns,
         "stop_reason": stop_reason,
     }
