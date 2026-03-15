@@ -25,14 +25,50 @@ data/wolof-dataset/curated_dataset.json
 
 The file must contain the full conversation list used by the Wolof pipeline.
 
+Method A also requires a separate **text-only Wolof corpus**. This corpus is
+used only to:
+
+- compute Wolof word frequencies
+- estimate the reference BPE fragmentation threshold
+- choose which over-fragmented words should be added to Qwen's tokenizer
+
+Preferred format:
+
+- plain text file with one sentence or paragraph per line
+
+Also supported:
+
+- `.json` with a list of strings or objects containing `text` / `content`
+- `.jsonl` with one `text` / `content` field per line
+
 ## Important Flags
 
 These are the two flags that matter most when you run the pipeline:
 
 - `--benchmark-samples`: number of conversations used for the tokenizer benchmark
 - `--full-samples`: size of the final fine-tuning pool after the benchmark
+- `--method-a-text-corpus-file`: separate text-only Wolof corpus used by Method A
+- `--english-replay-dataset`: optional English replay dataset mixed into the
+  final training split only
+- `--math-replay-dataset`: optional math replay dataset mixed into the final
+  training split only
+- `--english-replay-sample-ratio`: replay size relative to `--full-samples`
+  (default `0.2`)
+- `--math-replay-sample-ratio`: math replay size relative to `--full-samples`
+  when exact mix ratios are not used
+- `--wolof-mix-ratio`, `--english-mix-ratio`, `--math-mix-ratio`: exact target
+  ratios for the final train mix
 
 Important: `--full-samples` is not "use the whole dataset automatically". It is the exact size of the final training pool you want.
+
+Replay sets are sampled separately and appended only to the final training
+split. The validation split remains Wolof-only so your final metric stays
+target-focused.
+
+Optional tokenizer benchmark extension:
+
+- `--include-method-c`: add a third tokenizer benchmark method based on a
+  Wolof-trained Unigram tokenizer with overlap-neighbor embedding transfer
 
 Defaults:
 
@@ -40,6 +76,41 @@ Defaults:
 - full fine-tuning sample size: `5000`
 - benchmark epochs: `3`
 - full fine-tuning epochs: `3`
+
+Important:
+
+- the final fine-tuning stage is capped at `3` epochs
+- the trainer saves one reusable checkpoint after each final fine-tuning epoch
+- saved epoch metadata is indexed in `final/epoch_checkpoints.json`
+
+Note: `--benchmark-bpe-vocab-size` and `--full-bpe-vocab-size` also define the
+target vocabulary size for Method C when `--include-method-c` is enabled.
+
+English replay dataset notes:
+
+- `--english-replay-dataset` accepts either a Hugging Face dataset repo id or a
+  local `.json` / `.jsonl` conversation file
+- local files can use either the Wolof pipeline `conversations` format or the
+  project-wide chat `messages` format
+- for Hugging Face datasets, `--english-replay-config`,
+  `--english-replay-split`, and `--english-replay-cache-dir` are also available
+
+Math replay dataset notes:
+
+- `--math-replay-dataset` accepts either a Hugging Face dataset repo id or a
+  local `.json` / `.jsonl` conversation file
+- local files can use either the Wolof pipeline `conversations` format or the
+  project-wide chat `messages` format
+- OpenReasoning-style rows with `problem` and `generated_solution` are also
+  supported; the loader strips `<think>...</think>` from `generated_solution`
+  and keeps only the visible assistant response
+- for `nvidia/OpenMathReasoning`, the CLI will automatically fall back from the
+  default split `train` to `cot`
+- for Hugging Face datasets, `--math-replay-config`,
+  `--math-replay-split`, and `--math-replay-cache-dir` are also available
+- if you pass `--wolof-mix-ratio`, `--english-mix-ratio`, and
+  `--math-mix-ratio`, those exact target train ratios override the
+  `--english-replay-sample-ratio` and `--math-replay-sample-ratio` heuristics
 
 ## Install
 
@@ -90,8 +161,14 @@ Use this before launching the default 1k and 5k run:
 ```bash
 uv run galsenai wolof run \
   --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus> \
   --benchmark-samples 32 \
   --full-samples 64 \
+  --english-replay-dataset data/samples/finetune_sample.jsonl \
+  --math-replay-dataset data/samples/finetune_sample.jsonl \
+  --wolof-mix-ratio 0.7 \
+  --english-mix-ratio 0.2 \
+  --math-mix-ratio 0.1 \
   --token-budget 64 \
   --benchmark-bpe-vocab-size 1024 \
   --full-bpe-vocab-size 2048 \
@@ -107,6 +184,13 @@ This runs the benchmark on `1000` samples and the final fine-tune on `5000` samp
 ```bash
 uv run galsenai wolof run \
   --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus> \
+  --english-replay-dataset HuggingFaceH4/ultrachat_200k \
+  --english-replay-split train_sft \
+  --math-replay-dataset <math-repo-or-file> \
+  --wolof-mix-ratio 0.7 \
+  --english-mix-ratio 0.2 \
+  --math-mix-ratio 0.1 \
   --output-dir outputs/wolof-local
 ```
 
@@ -158,7 +242,41 @@ This runs the benchmark on `1000` samples and the final fine-tune on `5000` samp
 ```bash
 uv run galsenai wolof run \
   --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus> \
   --output-dir outputs/wolof-h100
+```
+
+### H100 run with Wolof / English / Math exact mix
+
+For the 70% Wolof / 20% English / 10% math train mix you asked for:
+
+```bash
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus> \
+  --english-replay-dataset HuggingFaceH4/ultrachat_200k \
+  --english-replay-split train_sft \
+  --math-replay-dataset <openreasoning-repo-or-file> \
+  --wolof-mix-ratio 0.7 \
+  --english-mix-ratio 0.2 \
+  --math-mix-ratio 0.1 \
+  --benchmark-samples 1000 \
+  --full-samples 132442 \
+  --benchmark-epochs 3 \
+  --full-epochs 3 \
+  --output-dir outputs/wolof-h100-mix-70-20-10
+```
+
+### H100 run with Method C included
+
+If you want to benchmark the additional literature-backed Method C as well:
+
+```bash
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus> \
+  --include-method-c \
+  --output-dir outputs/wolof-h100-method-c
 ```
 
 After training finishes, upload that run with:
@@ -176,6 +294,7 @@ If you want a larger final training pool but not the full dataset:
 ```bash
 uv run galsenai wolof run \
   --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus> \
   --benchmark-samples 1000 \
   --full-samples 20000 \
   --benchmark-epochs 3 \
@@ -217,6 +336,7 @@ This is the recommended command. It uses:
 ```bash
 uv run galsenai wolof run \
   --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus> \
   --benchmark-samples 1000 \
   --full-samples 132442 \
   --benchmark-epochs 3 \
@@ -248,6 +368,7 @@ Use this only if you intentionally want the benchmark conversations to be eligib
 ```bash
 uv run galsenai wolof run \
   --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus> \
   --benchmark-samples 1000 \
   --full-samples 133442 \
   --benchmark-epochs 3 \
@@ -286,13 +407,120 @@ Important files:
 
 - `nvidia_smi.txt`: captured GPU detection output
 - `data_splits.json`: sampled benchmark and training splits
+- `method_a_text_corpus.json`: the external text corpus path and text count used by Method A
+- `english_replay_dataset.json`: English replay sampling metadata when enabled
+- `math_replay_dataset.json`: math replay sampling metadata when enabled
+- `train_mix.json`: final train composition and exact target ratios when used
 - `benchmark/comparison.json`: tokenizer benchmark comparison
 - `benchmark/method_a/` and `benchmark/method_b/`: tokenizer artifacts and benchmark training summaries
+- `benchmark/method_c/`: tokenizer artifacts and benchmark training summaries when `--include-method-c` is enabled
+- `afrobench/<timestamp>/summary.json`: downstream Wolof AfroBench benchmark summary when run
+- `afrobench/<timestamp>/report.md`: Markdown report for the downstream Wolof AfroBench benchmark
+- `afrobench/epoch-checkpoints/summary.json`: per-epoch AfroBench comparison for the final fine-tuning checkpoints
+- `afrobench/epoch-checkpoints/report.md`: Markdown report for the per-epoch AfroBench comparison
 - `final/final_result.json`: final validation metrics and selected tokenizer
+- `final/epoch_checkpoints.json`: saved final fine-tuning checkpoints with epoch, `eval_loss`, and perplexity
 - `final/sample_generations.json`: generated Wolof samples
 - `final/model/`: trainer checkpoint output
 - `run_summary.json`: compact machine-readable run summary
 - `wolof_finetuning_report.md`: human-readable summary of the whole run
+
+## Wolof AfroBench Benchmark
+
+After any Wolof run finishes, you can benchmark the resulting model on the
+Wolof AfroBench suite with the built-in CLI command. The command auto-detects
+PEFT adapters saved under `final/model/` and reuses the resized tokenizer from
+the run output.
+
+Smoke check on a small slice of the benchmark:
+
+```bash
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof-openmathreasoning-smoke/<run-id> \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1 \
+  --limit 2
+```
+
+Useful flags:
+
+- `--tasks`: comma-separated Wolof suites. Supported values are
+  `afrimmlu`, `afrixnli`, `belebele`, `afriqa`, `sib`, `afrimgsm_direct`,
+  `afrimgsm_translate`, `afrimgsm_en_cot`, and `afrimmlu_math`
+- `--prompt-variants`: AfroBench prompt template ids, from `1` to `5`
+- `--limit`: small value for smoke checks, omitted for a full benchmark
+- `--num-fewshot`: few-shot count passed directly to `lm_eval`
+- `--batch-size`: `auto` by default
+- `--load-in-4bit`: optional quantized benchmark loading on smaller GPUs
+
+Example full Wolof core benchmark after training:
+
+```bash
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof-full-all/<run-id> \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1,2,3,4,5 \
+  --batch-size auto
+```
+
+If you want to benchmark a standalone adapter or a merged model without
+pointing to the whole run directory, use:
+
+```bash
+uv run galsenai wolof benchmark \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --adapter-path outputs/wolof-full-all/<run-id>/final/model \
+  --tokenizer-path outputs/wolof-full-all/<run-id>/final/tokenizer
+```
+
+You can also benchmark directly from a Hugging Face repo id:
+
+```bash
+uv run galsenai wolof benchmark \
+  --model-path your-username/your-wolof-model \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1,2,3,4,5
+```
+
+This works for:
+
+- a full model repo on Hugging Face
+- an uploaded PEFT adapter repo on Hugging Face
+- a downloaded local model directory
+- a local training run via `--run-dir`
+
+Outputs:
+
+- `raw_results.json`: direct `lm_eval` output
+- `summary.json`: compact machine-readable benchmark summary
+- `report.md`: readable Markdown table with per-task and aggregate scores
+
+### Benchmark Every Saved Fine-Tuning Epoch
+
+When the final training stage uses `2` or `3` epochs, the trainer keeps one
+checkpoint per epoch under `final/model/checkpoint-*`. To benchmark all saved
+epochs and pick the best one:
+
+```bash
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof-full-all/<run-id> \
+  --all-epochs \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1,2,3,4,5
+```
+
+This command writes:
+
+- `afrobench/epoch-checkpoints/epoch-1/`, `epoch-2/`, `epoch-3/`: per-epoch benchmark outputs
+- `afrobench/epoch-checkpoints/summary.json`: merged comparison across epochs
+- `afrobench/epoch-checkpoints/report.md`: readable comparison report
+
+The benchmark summary reports `best_epoch` using this tie-break order:
+
+- highest downstream AfroBench score
+- then lowest validation perplexity from training
+- then lowest validation `eval_loss`
+- then latest epoch
 
 ## Publish To Hugging Face
 
@@ -351,6 +579,7 @@ Check these sections first:
 
 - `Environment`: confirms GPU, precision, and training strategy
 - `Tokenizer Comparison`: compares Method A and Method B
+- `Tokenizer Comparison`: compares all benchmarked methods, including Method C when enabled
 - `Recommendation`: shows which tokenizer won
 - `Full Fine-Tuning`: contains final validation loss and perplexity
 - `Sample Generations`: qualitative Wolof outputs
@@ -427,6 +656,17 @@ The pipeline already retries with a reduced training plan. If you still hit OOM:
 - reduce `--full-samples` for the first test
 - reduce epochs for the first validation run
 - use the local smoke command before launching a large run
+
+### `Method A now requires a separate text-only corpus`
+
+If the run stops with a message asking for `--method-a-text-corpus-file`, pass
+an external Wolof text corpus file. Example:
+
+```bash
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus>
+```
 
 ### Run restarts after failure
 

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import copy
 import json
+import warnings
 from collections.abc import Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers.utils import logging as transformers_logging
 
 from .config import GenerationConfig
 from .schemas import Message, ToolCall, ToolFunctionCall
@@ -38,6 +42,90 @@ def _detect_peft_base_model(reference: str | Path) -> str | None:
     return None
 
 
+def _requires_trust_remote_code(error: Exception) -> bool:
+    message = str(error)
+    markers = (
+        "trust_remote_code=True",
+        "requires you to execute the configuration file",
+        "requires you to execute the modeling file",
+        "Please pass the argument `trust_remote_code=True`",
+    )
+    return any(marker in message for marker in markers)
+
+
+def _load_tokenizer(reference: str) -> Any:
+    try:
+        return AutoTokenizer.from_pretrained(reference, trust_remote_code=False)
+    except ValueError as error:
+        if not _requires_trust_remote_code(error):
+            raise
+    return AutoTokenizer.from_pretrained(reference, trust_remote_code=True)
+
+
+def _load_causal_lm(
+    reference: str,
+    *,
+    device_map: str,
+    dtype: Any,
+) -> Any:
+    common_kwargs = {
+        "device_map": device_map,
+        "dtype": dtype,
+    }
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            reference,
+            trust_remote_code=False,
+            **common_kwargs,
+        )
+    except ValueError as error:
+        if not _requires_trust_remote_code(error):
+            raise
+    return AutoModelForCausalLM.from_pretrained(
+        reference,
+        trust_remote_code=True,
+        **common_kwargs,
+    )
+
+
+@contextmanager
+def _quiet_transformers_output() -> Any:
+    verbosity = transformers_logging.get_verbosity()
+    progress_bar_enabled = transformers_logging.is_progress_bar_enabled()
+    transformers_logging.set_verbosity_error()
+    transformers_logging.disable_progress_bar()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Passing `generation_config` together with generation-related arguments=.*",
+        )
+        yield
+    transformers_logging.set_verbosity(verbosity)
+    if progress_bar_enabled:
+        transformers_logging.enable_progress_bar()
+
+
+def _build_generation_config(model: Any, generation: GenerationConfig) -> Any:
+    base_generation_config = getattr(model, "generation_config", None)
+    if base_generation_config is None:
+        return None
+
+    request_config = copy.deepcopy(base_generation_config)
+    request_config.max_new_tokens = generation.max_new_tokens
+    request_config.max_length = None
+    request_config.do_sample = generation.do_sample
+
+    if generation.do_sample:
+        request_config.temperature = generation.temperature
+        request_config.top_p = generation.top_p
+    else:
+        for attribute in ("temperature", "top_p", "top_k", "typical_p"):
+            if hasattr(request_config, attribute):
+                setattr(request_config, attribute, None)
+
+    return request_config
+
+
 def build_generation_pipeline(
     *,
     model_path: str,
@@ -52,60 +140,60 @@ def build_generation_pipeline(
     adapter_ref: str | None = None
     is_adapter_model = False
 
-    if adapter_path is None:
-        inferred_base_model_name = _detect_peft_base_model(model_path)
-        if inferred_base_model_name is None:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                device_map=device_map,
-                dtype=model_dtype,
-                trust_remote_code=True,
-            )
+    with _quiet_transformers_output():
+        if adapter_path is None:
+            inferred_base_model_name = _detect_peft_base_model(model_path)
+            if inferred_base_model_name is None:
+                model = _load_causal_lm(
+                    model_path,
+                    device_map=device_map,
+                    dtype=model_dtype,
+                )
+            else:
+                from peft import PeftModel
+
+                is_adapter_model = True
+                adapter_ref = model_path
+                tokenizer_ref = model_path
+                resolved_base_model_name = (
+                    resolved_base_model_name or inferred_base_model_name
+                )
+                if not resolved_base_model_name:
+                    raise ValueError(
+                        "Could not determine the base model for the adapter repository."
+                    )
+                tokenizer = _load_tokenizer(tokenizer_ref)
+                base_model = _load_causal_lm(
+                    resolved_base_model_name,
+                    device_map=device_map,
+                    dtype=model_dtype,
+                )
+                if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
+                    base_model.resize_token_embeddings(len(tokenizer))
+                model = PeftModel.from_pretrained(base_model, adapter_ref)
         else:
             from peft import PeftModel
 
             is_adapter_model = True
-            adapter_ref = model_path
-            tokenizer_ref = model_path
+            adapter_ref = str(adapter_path)
+            tokenizer_ref = adapter_ref
+            inferred_base_model_name = _detect_peft_base_model(adapter_ref)
             resolved_base_model_name = resolved_base_model_name or inferred_base_model_name
             if not resolved_base_model_name:
                 raise ValueError(
-                    "Could not determine the base model for the adapter repository."
+                    "Adapter loading requires --base-model-name or a valid adapter_config.json."
                 )
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=True)
-            base_model = AutoModelForCausalLM.from_pretrained(
+            tokenizer = _load_tokenizer(tokenizer_ref)
+            base_model = _load_causal_lm(
                 resolved_base_model_name,
                 device_map=device_map,
                 dtype=model_dtype,
-                trust_remote_code=True,
             )
             if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
                 base_model.resize_token_embeddings(len(tokenizer))
             model = PeftModel.from_pretrained(base_model, adapter_ref)
-    else:
-        from peft import PeftModel
 
-        is_adapter_model = True
-        adapter_ref = str(adapter_path)
-        tokenizer_ref = adapter_ref
-        inferred_base_model_name = _detect_peft_base_model(adapter_ref)
-        resolved_base_model_name = resolved_base_model_name or inferred_base_model_name
-        if not resolved_base_model_name:
-            raise ValueError(
-                "Adapter loading requires --base-model-name or a valid adapter_config.json."
-            )
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=True)
-        base_model = AutoModelForCausalLM.from_pretrained(
-            resolved_base_model_name,
-            device_map=device_map,
-            dtype=model_dtype,
-            trust_remote_code=True,
-        )
-        if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
-            base_model.resize_token_embeddings(len(tokenizer))
-        model = PeftModel.from_pretrained(base_model, adapter_ref)
-
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_ref, trust_remote_code=True)
+        tokenizer = _load_tokenizer(tokenizer_ref)
     if tokenizer.pad_token is None and tokenizer.eos_token is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -189,17 +277,21 @@ def generate_first_assistant(
     tool_registry: str = "none",
 ) -> Message:
     payload = [message_to_chat_dict(message) for message in messages]
-    kwargs: dict[str, Any] = {
-        "max_new_tokens": generation.max_new_tokens,
-        "do_sample": generation.do_sample,
-    }
-    if generation.do_sample:
-        kwargs["temperature"] = generation.temperature
-        kwargs["top_p"] = generation.top_p
+    kwargs: dict[str, Any] = {}
+    generation_config = _build_generation_config(getattr(pipe, "model", None), generation)
+    if generation_config is not None:
+        kwargs["generation_config"] = generation_config
+    else:
+        kwargs["max_new_tokens"] = generation.max_new_tokens
+        kwargs["do_sample"] = generation.do_sample
+        if generation.do_sample:
+            kwargs["temperature"] = generation.temperature
+            kwargs["top_p"] = generation.top_p
 
     if tool_registry == "sample" and tool_names:
         kwargs["tools"] = get_tool_functions(tool_names)
 
-    response = pipe(payload, **kwargs)
+    with _quiet_transformers_output():
+        response = pipe(payload, **kwargs)
     generated_output = response[0]["generated_text"] if isinstance(response, list) else response
     return extract_assistant_message(generated_output)

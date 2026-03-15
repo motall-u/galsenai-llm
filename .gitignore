@@ -150,8 +150,14 @@ outputs/*
 !outputs/eval/
 !outputs/eval/**
 
-# Local Wolof datasets
-data/wolof-dataset/
+# Local datasets and corpora
+data/*
+!data/README.md
+!data/samples/
+!data/samples/**
+
+# Local benchmark artifacts
+benchmark_result/
 
 # SageMath parsed files
 *.sage.py
@@ -227,6 +233,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-
 
 darft.md

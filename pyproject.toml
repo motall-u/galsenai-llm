@@ -21,6 +21,7 @@ train = [
   "accelerate>=1.2.1",
   "bitsandbytes>=0.49.2",
   "datasets>=3.2.0",
+  "lm_eval @ git+https://github.com/The-African-Research-Collective/lm-evaluation-harness.git@ee48640dfbea5f909bfb9dbd9206b4ea0de9c706",
   "peft>=0.13.2",
   "torch>=2.5.1",
   "transformers>=4.56.0",
@@ -39,6 +40,9 @@ galsenai = "galsenai_llm.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/galsenai_llm"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.uv]
 package = true

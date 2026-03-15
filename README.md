@@ -13,7 +13,8 @@ uv run galsenai train --config configs/train/sample_qwen_tool_calling.yaml
 uv run galsenai merge --config configs/merge/sample_merge.yaml
 uv run galsenai benchmark run --config configs/benchmark/sample_benchmark.yaml
 uv run galsenai wolof infer --prompt "Nanga def?"
-uv run galsenai wolof run --dataset-file data/wolof-dataset/curated_dataset.json
+uv run galsenai wolof run --dataset-file data/wolof-dataset/curated_dataset.json --method-a-text-corpus-file <path-to-text-only-wolof-corpus>
+uv run galsenai wolof benchmark --run-dir outputs/wolof/<run-id> --prompt-variants 1 --limit 2
 ```
 
 ## Wolof End-to-End Run
@@ -23,7 +24,9 @@ tokenizer benchmark and the follow-up fine-tuning job:
 
 ```bash
 uv sync --extra train --extra dev
-uv run galsenai wolof run --dataset-file data/wolof-dataset/curated_dataset.json
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file <path-to-text-only-wolof-corpus>
 ```
 
 After a run completes, publish it with:
@@ -32,12 +35,84 @@ After a run completes, publish it with:
 uv run galsenai wolof upload --run-dir outputs/wolof/<run-id> --repo-id your-username/your-wolof-model
 ```
 
+Run the Wolof downstream AfroBench smoke benchmark with:
+
+```bash
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof/<run-id> \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1 \
+  --limit 2
+```
+
+Or benchmark a model directly from Hugging Face:
+
+```bash
+uv run galsenai wolof benchmark \
+  --model-path your-username/your-wolof-model \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1
+```
+
 The command always runs both stages:
 
 - Step 1 benchmark on 1,000 sampled conversations with Method A vs Method B.
-- Step 2 fine-tuning on 5,000 sampled conversations using the winning tokenizer.
+- Method A now uses a separate text-only Wolof corpus to compute word frequencies and the BPE-based over-fragmentation threshold.
+- Optional: add `--include-method-c` to benchmark a third Unigram-based tokenizer adaptation method.
+- Optional: add `--english-replay-dataset <repo-or-file>` and `--math-replay-dataset <repo-or-file>` to mix English and math replay sets into the final fine-tuning stage.
+- Math replay also accepts OpenReasoning-style rows with `problem` and `generated_solution`; the loader drops `<think>...</think>` and keeps only the final response.
+- For `nvidia/OpenMathReasoning`, the loader automatically falls back from `train` to `cot`.
+- Optional: add `--wolof-mix-ratio 0.7 --english-mix-ratio 0.2 --math-mix-ratio 0.1` to target a 70/20/10 final train mix while keeping validation Wolof-only.
+- Step 2 fine-tuning on `--full-samples` Wolof conversations using the winning tokenizer, with optional English and math replay mixed into the final training split only.
+- Final fine-tuning is capped at `3` epochs, and the trainer saves a reusable checkpoint after each epoch under `final/model/checkpoint-*`.
+- `final/epoch_checkpoints.json` indexes every saved epoch checkpoint with its epoch number, `eval_loss`, and perplexity.
 - Markdown logging, tokenizer artifacts, checkpoints, validation loss, and sample generations under `outputs/wolof/<run-id>/`.
 - Upload, download, CLI inference, interactive chat, and full run guide: `resources/wolof_run_guide.md`
+
+To benchmark every saved final-training epoch and compare them directly:
+
+```bash
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof/<run-id> \
+  --all-epochs \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1,2,3,4,5
+```
+
+This writes a comparison summary under `outputs/wolof/<run-id>/afrobench/epoch-checkpoints/`.
+
+### Inspect Method A Token Selection
+
+After a Wolof run, Method A writes its token selection artifact to:
+
+- `outputs/wolof/<run-id>/benchmark/method_a/token_selection.json`
+
+If Method A wins the tokenizer benchmark, the same artifact is also copied to:
+
+- `outputs/wolof/<run-id>/final/token_selection.json`
+
+This file contains the values used to decide whether a Wolof word is a candidate
+for tokenizer expansion:
+
+- `fragmentation_threshold`: the weighted average number of fragments produced by a reference Wolof BPE tokenizer trained on the separate text-only corpus passed with `--method-a-text-corpus-file`
+- `candidate_summary.min_frequency`: the hard minimum frequency filter applied before ranking candidates
+- `selected_tokens[*].frequency`: corpus frequency of the selected word
+- `selected_tokens[*].fragment_count`: number of pieces produced by the base Qwen tokenizer
+- `selected_tokens[*].reference_fragment_count`: number of pieces produced by the reference Wolof BPE tokenizer
+- `selected_tokens[*].fragmentation_gap`: `fragment_count - fragmentation_threshold`
+- `selected_tokens[*].score`: ranking score used for selection, currently `frequency * fragmentation_gap`
+
+The current Method A candidate rule is:
+
+- keep only words with `len(word) >= 3`
+- keep only words with `frequency >= 2`
+- keep only words where `fragment_count > fragmentation_threshold`
+- rank the remaining words by `frequency * fragmentation_gap`
+- keep the top `token_budget` words
+
+The file `outputs/wolof/<run-id>/method_a_text_corpus.json` records which
+external text corpus was used to compute these frequencies and the reference
+fragmentation threshold.
 
 On an H100-class GPU the pipeline now auto-switches to:
 
@@ -70,6 +145,7 @@ The codebase is intentionally split by responsibility so maintainers can change 
 - `src/galsenai_llm/infer.py`: Single-prompt inference flow built on top of `generation.py`.
 - `src/galsenai_llm/evaluate.py`: Prediction scoring logic against the benchmark dataset.
 - `src/galsenai_llm/benchmark.py`: Benchmark orchestration. It can score an existing predictions file, run oracle mode, or generate first-turn predictions with a local model.
+- `src/galsenai_llm/afrobench.py`: Wolof downstream benchmarking with the TRC `lm-evaluation-harness` AfroBench task suite.
 - `src/galsenai_llm/wolof_pipeline.py`: End-to-end Wolof tokenizer benchmarking and low-resource fine-tuning pipeline for Qwen 2.5 0.5B.
 - `src/galsenai_llm/tool_registry.py`: Deterministic local reference tools used by the sample datasets and benchmarks.
 

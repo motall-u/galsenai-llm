@@ -192,6 +192,102 @@ def wolof_run(
         exists=True,
         readable=True,
     ),
+    method_a_text_corpus_file: Path | None = typer.Option(
+        None,
+        "--method-a-text-corpus-file",
+        help=(
+            "Separate text-only Wolof corpus used only by Method A to compute "
+            "word frequencies and the BPE fragmentation threshold."
+        ),
+    ),
+    english_replay_dataset: str | None = typer.Option(
+        None,
+        "--english-replay-dataset",
+        help=(
+            "Optional English replay dataset mixed into the final training set "
+            "to reduce catastrophic forgetting. Accepts a Hugging Face dataset "
+            "repo id or a local .json/.jsonl conversation dataset file."
+        ),
+    ),
+    english_replay_config: str | None = typer.Option(
+        None,
+        "--english-replay-config",
+        help="Optional Hugging Face dataset config name for the English replay dataset.",
+    ),
+    english_replay_split: str = typer.Option(
+        "train_sft",
+        "--english-replay-split",
+        help="Split name used when loading the English replay dataset from Hugging Face.",
+    ),
+    english_replay_sample_ratio: float = typer.Option(
+        0.2,
+        "--english-replay-sample-ratio",
+        help=(
+            "Replay sample size as a fraction of --full-samples. "
+            "For example, 0.2 adds English replay equal to 20% of the Wolof full sample size."
+        ),
+    ),
+    english_replay_cache_dir: Path | None = typer.Option(
+        None,
+        "--english-replay-cache-dir",
+        help="Optional cache directory for Hugging Face English replay downloads.",
+    ),
+    math_replay_dataset: str | None = typer.Option(
+        None,
+        "--math-replay-dataset",
+        help=(
+            "Optional math replay dataset mixed into the final training set. "
+            "Accepts a Hugging Face dataset repo id or a local "
+            ".json/.jsonl conversation dataset file."
+        ),
+    ),
+    math_replay_config: str | None = typer.Option(
+        None,
+        "--math-replay-config",
+        help="Optional Hugging Face dataset config name for the math replay dataset.",
+    ),
+    math_replay_split: str = typer.Option(
+        "train",
+        "--math-replay-split",
+        help="Split name used when loading the math replay dataset from Hugging Face.",
+    ),
+    math_replay_sample_ratio: float = typer.Option(
+        0.0,
+        "--math-replay-sample-ratio",
+        help=(
+            "Math replay sample size as a fraction of --full-samples "
+            "when exact mix ratios are not used."
+        ),
+    ),
+    math_replay_cache_dir: Path | None = typer.Option(
+        None,
+        "--math-replay-cache-dir",
+        help="Optional cache directory for Hugging Face math replay downloads.",
+    ),
+    wolof_mix_ratio: float | None = typer.Option(
+        None,
+        "--wolof-mix-ratio",
+        help=(
+            "Exact target ratio for Wolof in the final training mix. "
+            "Use together with --english-mix-ratio and --math-mix-ratio."
+        ),
+    ),
+    english_mix_ratio: float | None = typer.Option(
+        None,
+        "--english-mix-ratio",
+        help=(
+            "Exact target ratio for English replay in the final training mix. "
+            "Use together with --wolof-mix-ratio and --math-mix-ratio."
+        ),
+    ),
+    math_mix_ratio: float | None = typer.Option(
+        None,
+        "--math-mix-ratio",
+        help=(
+            "Exact target ratio for math replay in the final training mix. "
+            "Use together with --wolof-mix-ratio and --english-mix-ratio."
+        ),
+    ),
     output_dir: Path = typer.Option(Path("outputs/wolof"), "--output-dir"),
     model_name: str = typer.Option("Qwen/Qwen2.5-0.5B-Instruct", "--model-name"),
     benchmark_samples: int = typer.Option(1000, "--benchmark-samples"),
@@ -200,7 +296,12 @@ def wolof_run(
     benchmark_bpe_vocab_size: int = typer.Option(8192, "--benchmark-bpe-vocab-size"),
     full_bpe_vocab_size: int = typer.Option(16384, "--full-bpe-vocab-size"),
     benchmark_epochs: int = typer.Option(3, "--benchmark-epochs"),
-    full_epochs: int = typer.Option(3, "--full-epochs"),
+    full_epochs: int = typer.Option(
+        3,
+        "--full-epochs",
+        help="Number of epochs for the final fine-tuning stage. Maximum: 3.",
+    ),
+    include_method_c: bool = typer.Option(False, "--include-method-c/--no-method-c"),
     seed: int = typer.Option(3407, "--seed"),
 ) -> None:
     from .wolof_pipeline import run_wolof_pipeline
@@ -208,6 +309,20 @@ def wolof_run(
     _print_report(
         run_wolof_pipeline(
             dataset_file=dataset_file,
+            method_a_text_corpus_file=method_a_text_corpus_file,
+            english_replay_dataset=english_replay_dataset,
+            english_replay_config=english_replay_config,
+            english_replay_split=english_replay_split,
+            english_replay_sample_ratio=english_replay_sample_ratio,
+            english_replay_cache_dir=english_replay_cache_dir,
+            math_replay_dataset=math_replay_dataset,
+            math_replay_config=math_replay_config,
+            math_replay_split=math_replay_split,
+            math_replay_sample_ratio=math_replay_sample_ratio,
+            math_replay_cache_dir=math_replay_cache_dir,
+            wolof_mix_ratio=wolof_mix_ratio,
+            english_mix_ratio=english_mix_ratio,
+            math_mix_ratio=math_mix_ratio,
             output_root=output_dir,
             model_name=model_name,
             benchmark_sample_size=benchmark_samples,
@@ -217,7 +332,159 @@ def wolof_run(
             full_bpe_vocab_size=full_bpe_vocab_size,
             benchmark_epochs=benchmark_epochs,
             full_epochs=full_epochs,
+            include_method_c=include_method_c,
             seed=seed,
+        )
+    )
+
+
+@wolof_app.command("benchmark")
+def wolof_benchmark(
+    run_dir: Path | None = typer.Option(
+        None,
+        "--run-dir",
+        exists=True,
+        file_okay=False,
+        readable=True,
+        help=(
+            "Optional Wolof training run directory. When provided, the command "
+            "auto-loads final/model and final/tokenizer from the run output."
+        ),
+    ),
+    model_path: str | None = typer.Option(
+        None,
+        "--model-path",
+        help=(
+            "Local model directory, local adapter directory, or Hugging Face "
+            "full-model / adapter repo id."
+        ),
+    ),
+    adapter_path: Path | None = typer.Option(
+        None,
+        "--adapter-path",
+        help="Optional PEFT adapter path when --model-path points to the base model.",
+    ),
+    tokenizer_path: Path | None = typer.Option(
+        None,
+        "--tokenizer-path",
+        help="Optional tokenizer directory with the resized Wolof tokenizer.",
+    ),
+    base_model_name: str | None = typer.Option(
+        None,
+        "--base-model-name",
+        help="Override the base model name when benchmarking a PEFT adapter.",
+    ),
+    tasks: str = typer.Option(
+        "afrimmlu,afrixnli,belebele",
+        "--tasks",
+        help=(
+            "Comma-separated Wolof AfroBench suites. Supported values: "
+            "afrimmlu, afrixnli, belebele, afriqa, sib, afrimgsm_direct, "
+            "afrimgsm_translate, afrimgsm_en_cot, afrimmlu_math."
+        ),
+    ),
+    prompt_variants: str = typer.Option(
+        "1,2,3,4,5",
+        "--prompt-variants",
+        help="Comma-separated AfroBench prompt template variants. Use `1` for a smoke run.",
+    ),
+    output_dir: Path | None = typer.Option(
+        None,
+        "--output-dir",
+        help="Optional directory for the AfroBench benchmark artifacts.",
+    ),
+    all_epochs: bool = typer.Option(
+        False,
+        "--all-epochs/--single-model",
+        help=(
+            "When used with --run-dir, benchmark every saved final fine-tuning epoch "
+            "checkpoint instead of only the final model."
+        ),
+    ),
+    limit: float | None = typer.Option(
+        None,
+        "--limit",
+        help="Optional per-task example limit. Use a small value such as 1 or 2 for smoke tests.",
+    ),
+    batch_size: str = typer.Option("auto", "--batch-size"),
+    max_batch_size: int | None = typer.Option(None, "--max-batch-size"),
+    num_fewshot: int = typer.Option(0, "--num-fewshot"),
+    device: str | None = typer.Option("cuda", "--device"),
+    dtype: str | None = typer.Option("auto", "--dtype"),
+    load_in_4bit: bool = typer.Option(False, "--load-in-4bit/--no-load-in-4bit"),
+    trust_remote_code: bool = typer.Option(False, "--trust-remote-code/--no-trust-remote-code"),
+    use_fast_tokenizer: bool = typer.Option(True, "--use-fast-tokenizer/--no-fast-tokenizer"),
+    add_bos_token: bool = typer.Option(False, "--add-bos-token/--no-add-bos-token"),
+    apply_chat_template: bool = typer.Option(
+        False,
+        "--apply-chat-template/--no-chat-template",
+    ),
+    fewshot_as_multiturn: bool = typer.Option(
+        False,
+        "--fewshot-as-multiturn/--no-fewshot-as-multiturn",
+    ),
+    log_samples: bool = typer.Option(False, "--log-samples/--no-log-samples"),
+    write_out: bool = typer.Option(False, "--write-out/--no-write-out"),
+    bootstrap_iters: int = typer.Option(0, "--bootstrap-iters"),
+) -> None:
+    from .afrobench import (
+        run_wolof_afrobench_benchmark,
+        run_wolof_afrobench_epoch_benchmarks,
+    )
+
+    if all_epochs:
+        if run_dir is None:
+            raise typer.BadParameter("--all-epochs requires --run-dir.")
+        _print_report(
+            run_wolof_afrobench_epoch_benchmarks(
+                run_dir=run_dir,
+                tasks=tasks,
+                prompt_variants=prompt_variants,
+                output_dir=output_dir,
+                limit=limit,
+                batch_size=batch_size,
+                max_batch_size=max_batch_size,
+                num_fewshot=num_fewshot,
+                device=device,
+                dtype=dtype,
+                load_in_4bit=load_in_4bit,
+                trust_remote_code=trust_remote_code,
+                use_fast_tokenizer=use_fast_tokenizer,
+                add_bos_token=add_bos_token,
+                apply_chat_template=apply_chat_template,
+                fewshot_as_multiturn=fewshot_as_multiturn,
+                log_samples=log_samples,
+                write_out=write_out,
+                bootstrap_iters=bootstrap_iters,
+            )
+        )
+        return
+
+    _print_report(
+        run_wolof_afrobench_benchmark(
+            model_path=model_path,
+            run_dir=run_dir,
+            adapter_path=adapter_path,
+            tokenizer_path=tokenizer_path,
+            base_model_name=base_model_name,
+            tasks=tasks,
+            prompt_variants=prompt_variants,
+            output_dir=output_dir,
+            limit=limit,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+            num_fewshot=num_fewshot,
+            device=device,
+            dtype=dtype,
+            load_in_4bit=load_in_4bit,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+            add_bos_token=add_bos_token,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            log_samples=log_samples,
+            write_out=write_out,
+            bootstrap_iters=bootstrap_iters,
         )
     )
 

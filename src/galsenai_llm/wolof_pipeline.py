@@ -5,9 +5,10 @@ import json
 import logging
 import math
 import random
+import re
 import subprocess
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -18,13 +19,25 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from datasets import Dataset
+from datasets import load_dataset as hf_load_dataset
+from datasets import load_dataset_builder as hf_load_dataset_builder
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from tokenizers import AddedToken
+from tokenizers import (
+    AddedToken,
+    SentencePieceUnigramTokenizer,
+    models,
+    pre_tokenizers,
+    trainers,
+)
+from tokenizers import (
+    Tokenizer as BackendTokenizer,
+)
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
     PreTrainedTokenizerBase,
+    PreTrainedTokenizerFast,
     set_seed,
 )
 from trl import SFTConfig, SFTTrainer
@@ -44,6 +57,19 @@ TARGET_MODULES = [
     "down_proj",
 ]
 WORD_JOINERS = {"'", "-", "\u2019"}
+ROLE_ALIASES = {
+    "assistant": "assistant",
+    "bot": "assistant",
+    "chatgpt": "assistant",
+    "gpt": "assistant",
+    "model": "assistant",
+    "user": "user",
+    "human": "user",
+    "customer": "user",
+    "system": "system",
+    "developer": "system",
+    "context": "system",
+}
 
 
 @dataclass(slots=True)
@@ -107,6 +133,7 @@ class TokenizerAdaptation:
     tokenizer: PreTrainedTokenizerBase
     tokenizer_dir: Path
     embedding_sources: dict[int, list[int]]
+    embedding_source_weights: dict[int, list[float]]
     metric_token_ids: list[int]
     initialize_all_token_ids: list[int]
     metadata: dict[str, Any]
@@ -348,6 +375,503 @@ def load_wolof_dataset(path: Path) -> list[ConversationRecord]:
     return records
 
 
+def _normalize_role(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return None
+    if normalized in {"system", "user", "assistant"}:
+        return ROLE_ALIASES.get(normalized, normalized)
+    return ROLE_ALIASES.get(normalized)
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            text = _coerce_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    if isinstance(value, dict):
+        for key in ("text", "content", "value", "message"):
+            text = _coerce_text(value.get(key))
+            if text:
+                return text
+        return ""
+    return str(value).strip()
+
+
+def _remove_tag_block(text: str, tag_name: str) -> str:
+    pattern = rf"<{tag_name}\b[^>]*>.*?</{tag_name}>"
+    return re.sub(pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
+
+
+def _unwrap_tag(text: str, tag_name: str) -> str:
+    pattern = rf"^\s*<{tag_name}\b[^>]*>(.*?)</{tag_name}>\s*$"
+    match = re.match(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return text
+    return match.group(1).strip()
+
+
+def _normalize_generated_solution(value: Any) -> str:
+    text = _coerce_text(value)
+    if not text:
+        return ""
+    text = _remove_tag_block(text, "think").strip()
+    text = _unwrap_tag(text, "answer")
+    text = re.sub(r"</?answer\b[^>]*>", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _normalize_message_entry(entry: Any) -> dict[str, str] | None:
+    if not isinstance(entry, dict):
+        return None
+    role = None
+    for key in ("role", "from", "speaker", "sender", "author"):
+        role = _normalize_role(entry.get(key))
+        if role is not None:
+            break
+    if role is None:
+        return None
+
+    content = ""
+    for key in ("content", "value", "text", "message"):
+        content = _coerce_text(entry.get(key))
+        if content:
+            break
+    if not content:
+        return None
+    return {"role": role, "content": content}
+
+
+def _normalize_message_sequence(messages: Any) -> list[dict[str, str]]:
+    if not isinstance(messages, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for entry in messages:
+        message = _normalize_message_entry(entry)
+        if message is not None:
+            normalized.append(message)
+    return normalized
+
+
+def _conversation_record_from_messages(
+    *,
+    conversation_id: str,
+    messages: Sequence[dict[str, str]],
+) -> ConversationRecord | None:
+    normalized_messages = [dict(message) for message in messages if message.get("content")]
+    if len(normalized_messages) < 2:
+        return None
+    if not any(message["role"] == "assistant" for message in normalized_messages):
+        return None
+    char_count = sum(len(message["content"]) for message in normalized_messages)
+    return ConversationRecord(
+        conversation_id=conversation_id,
+        conversations=normalized_messages,
+        turn_count=len(normalized_messages),
+        char_count=char_count,
+    )
+
+
+def _replay_source_slug(source_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", source_name.lower()).strip("-")
+    return slug or "english-replay"
+
+
+def _conversation_record_from_entry(
+    item: Any,
+    *,
+    index: int,
+    source_name: str,
+) -> ConversationRecord | None:
+    if not isinstance(item, dict):
+        return None
+
+    base_id = item.get("conversation_id") or item.get("id") or item.get("uuid") or f"row_{index}"
+    conversation_id = f"{_replay_source_slug(source_name)}::{base_id}"
+
+    for key in (
+        "conversations",
+        "messages",
+        "dialogue",
+        "dialog",
+        "conversation",
+        "chat",
+        "chosen",
+    ):
+        messages = _normalize_message_sequence(item.get(key))
+        if messages:
+            record = _conversation_record_from_messages(
+                conversation_id=conversation_id,
+                messages=messages,
+            )
+            if record is not None:
+                return record
+
+    problem_text = _coerce_text(item.get("problem"))
+    generated_solution_text = _normalize_generated_solution(
+        item.get("generated_solution"),
+    )
+    if problem_text and generated_solution_text:
+        return _conversation_record_from_messages(
+            conversation_id=conversation_id,
+            messages=[
+                {"role": "user", "content": problem_text},
+                {"role": "assistant", "content": generated_solution_text},
+            ],
+        )
+
+    system_text = ""
+    for key in ("system", "system_prompt"):
+        system_text = _coerce_text(item.get(key))
+        if system_text:
+            break
+
+    user_text = ""
+    for key in ("instruction", "prompt", "question", "query"):
+        user_text = _coerce_text(item.get(key))
+        if user_text:
+            break
+    supplemental_user_text = ""
+    for key in ("input", "context"):
+        supplemental_user_text = _coerce_text(item.get(key))
+        if supplemental_user_text:
+            break
+    if not user_text:
+        user_text = supplemental_user_text
+        supplemental_user_text = ""
+    elif supplemental_user_text and supplemental_user_text != user_text:
+        user_text = f"{user_text}\n\n{supplemental_user_text}"
+
+    assistant_text = ""
+    for key in ("output", "response", "answer", "completion"):
+        assistant_text = _coerce_text(item.get(key))
+        if assistant_text:
+            break
+    if not assistant_text and isinstance(item.get("chosen"), str):
+        assistant_text = _coerce_text(item["chosen"])
+
+    if not user_text or not assistant_text:
+        return None
+
+    messages = []
+    if system_text:
+        messages.append({"role": "system", "content": system_text})
+    messages.append({"role": "user", "content": user_text})
+    messages.append({"role": "assistant", "content": assistant_text})
+    return _conversation_record_from_messages(
+        conversation_id=conversation_id,
+        messages=messages,
+    )
+
+
+def load_conversation_dataset(
+    path: Path,
+    *,
+    source_name: str | None = None,
+) -> list[ConversationRecord]:
+    normalized_path = path.expanduser()
+    suffix = normalized_path.suffix.lower()
+    raw_entries: list[Any]
+
+    if suffix == ".json":
+        with normalized_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, list):
+            raw_entries = payload
+        elif isinstance(payload, dict):
+            raw_entries = []
+            for key in ("records", "data", "items", "examples"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    raw_entries = value
+                    break
+            if not raw_entries:
+                raw_entries = [payload]
+        else:
+            raw_entries = []
+    elif suffix == ".jsonl":
+        raw_entries = []
+        with normalized_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                raw_entries.append(json.loads(line))
+    else:
+        raise ValueError(
+            f"Unsupported conversation dataset format for {normalized_path}. "
+            "Use .json or .jsonl."
+        )
+
+    records: list[ConversationRecord] = []
+    dataset_name = source_name or normalized_path.stem
+    for index, entry in enumerate(raw_entries):
+        record = _conversation_record_from_entry(
+            entry,
+            index=index,
+            source_name=dataset_name,
+        )
+        if record is not None:
+            records.append(record)
+    if not records:
+        raise ValueError(f"No usable conversations were loaded from {normalized_path}.")
+    return records
+
+
+def load_replay_dataset(
+    source: str,
+    *,
+    config_name: str | None,
+    split: str,
+    sample_size: int,
+    cache_dir: Path | None,
+    seed: int,
+) -> tuple[list[ConversationRecord], dict[str, Any]]:
+    normalized_source = source.strip()
+    if not normalized_source:
+        raise ValueError("Replay dataset source cannot be empty.")
+
+    local_path = Path(normalized_source).expanduser()
+    if local_path.exists():
+        records = load_conversation_dataset(local_path, source_name=local_path.stem)
+        available_record_count = len(records)
+        sample_strategy = "all_local_records"
+        if sample_size < len(records):
+            records, _ = stratified_sample(records, sample_size, seed=seed)
+            sample_strategy = "stratified_local_sample"
+        metadata = {
+            "enabled": True,
+            "source_type": "local_file",
+            "source": str(local_path),
+            "config_name": None,
+            "split": None,
+            "requested_sample_size": sample_size,
+            "loaded_sample_size": len(records),
+            "available_record_count": available_record_count,
+            "sample_strategy": sample_strategy,
+        }
+        return records, metadata
+
+    builder = hf_load_dataset_builder(
+        normalized_source,
+        name=config_name,
+        cache_dir=None if cache_dir is None else str(cache_dir),
+    )
+    split_map = builder.info.splits or {}
+    available_splits = list(split_map)
+    resolved_split = split
+    used_split_fallback = False
+    if resolved_split not in split_map:
+        if resolved_split == "train":
+            fallback_candidates = (
+                "cot",
+                "train_sft",
+                "default",
+                "tir",
+                "genselect",
+                "additional_problems",
+            )
+            for candidate in fallback_candidates:
+                if candidate in split_map:
+                    logger.info(
+                        "Replay dataset %s does not expose split '%s'; using '%s' instead.",
+                        normalized_source,
+                        split,
+                        candidate,
+                    )
+                    resolved_split = candidate
+                    used_split_fallback = True
+                    break
+            else:
+                if len(available_splits) == 1:
+                    resolved_split = available_splits[0]
+                    used_split_fallback = True
+        if resolved_split not in split_map:
+            raise ValueError(
+                f"Split '{split}' is not available for {normalized_source}. "
+                f"Available splits: {available_splits}."
+            )
+
+    split_info = split_map.get(resolved_split)
+    raw_row_count = None if split_info is None else split_info.num_examples
+    dataset = hf_load_dataset(
+        normalized_source,
+        name=config_name,
+        split=resolved_split,
+        streaming=True,
+        cache_dir=None if cache_dir is None else str(cache_dir),
+    )
+    shuffle_buffer_size = max(sample_size * 20, 1024)
+    records: list[ConversationRecord] = []
+    invalid_rows = 0
+    for index, row in enumerate(
+        dataset.shuffle(seed=seed, buffer_size=shuffle_buffer_size),
+    ):
+        record = _conversation_record_from_entry(
+            row,
+            index=index,
+            source_name=normalized_source,
+        )
+        if record is None:
+            invalid_rows += 1
+            continue
+        records.append(record)
+        if len(records) >= sample_size:
+            break
+    if not records:
+        raise ValueError(
+            "The replay dataset did not yield any usable conversations. "
+            "Use a chat-style dataset with messages or prompt/response fields."
+        )
+    metadata = {
+        "enabled": True,
+        "source_type": "hf_dataset",
+        "source": normalized_source,
+        "config_name": config_name,
+        "split": resolved_split,
+        "requested_split": split,
+        "available_splits": available_splits,
+        "requested_sample_size": sample_size,
+        "loaded_sample_size": len(records),
+        "available_row_count": raw_row_count,
+        "invalid_row_count": invalid_rows,
+        "sample_strategy": "streaming_shuffle_buffer",
+        "shuffle_buffer_size": shuffle_buffer_size,
+        "used_split_fallback": used_split_fallback,
+        "cache_dir": None if cache_dir is None else str(cache_dir),
+    }
+    return records, metadata
+
+
+def _validate_sample_ratio(name: str, value: float) -> None:
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between 0.0 and 1.0.")
+
+
+def _resolve_exact_mix_sample_sizes(
+    *,
+    wolof_train_size: int,
+    wolof_mix_ratio: float | None,
+    english_mix_ratio: float | None,
+    math_mix_ratio: float | None,
+) -> dict[str, int] | None:
+    ratio_values = [wolof_mix_ratio, english_mix_ratio, math_mix_ratio]
+    if all(value is None for value in ratio_values):
+        return None
+    if any(value is None for value in ratio_values):
+        raise ValueError(
+            "Exact mix mode requires --wolof-mix-ratio, --english-mix-ratio, "
+            "and --math-mix-ratio together."
+        )
+
+    assert wolof_mix_ratio is not None
+    assert english_mix_ratio is not None
+    assert math_mix_ratio is not None
+
+    for name, value in (
+        ("Wolof mix ratio", wolof_mix_ratio),
+        ("English mix ratio", english_mix_ratio),
+        ("Math mix ratio", math_mix_ratio),
+    ):
+        _validate_sample_ratio(name, value)
+
+    ratio_sum = wolof_mix_ratio + english_mix_ratio + math_mix_ratio
+    if not math.isclose(ratio_sum, 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(
+            "Exact mix ratios must sum to 1.0. "
+            f"Received {ratio_sum:.6f}."
+        )
+    if wolof_mix_ratio <= 0.0:
+        raise ValueError("Wolof mix ratio must be greater than 0.0.")
+
+    def _scaled_count(target_ratio: float) -> int:
+        if target_ratio <= 0.0:
+            return 0
+        scaled = wolof_train_size * target_ratio / wolof_mix_ratio
+        return max(1, int(round(scaled)))
+
+    return {
+        "english": _scaled_count(english_mix_ratio),
+        "math": _scaled_count(math_mix_ratio),
+    }
+
+
+def _normalize_text_entries(entries: Iterable[Any]) -> list[str]:
+    texts: list[str] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            text = entry.strip()
+            if text:
+                texts.append(text)
+            continue
+        if isinstance(entry, dict):
+            for key in ("text", "content"):
+                value = entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    texts.append(value.strip())
+                    break
+    return texts
+
+
+def load_text_corpus(path: Path) -> list[str]:
+    suffix = path.suffix.lower()
+    if suffix in {".txt", ".text", ".md"}:
+        raw_text = path.read_text(encoding="utf-8")
+        chunks = [chunk.strip() for chunk in re.split(r"\n\s*\n", raw_text)]
+        texts = [chunk for chunk in chunks if chunk]
+        if len(texts) > 1:
+            return texts
+        line_texts = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        if line_texts:
+            return line_texts
+        return texts
+
+    if suffix == ".json":
+        with path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if isinstance(payload, list):
+            texts = _normalize_text_entries(payload)
+        elif isinstance(payload, dict):
+            texts = _normalize_text_entries(payload.get("texts", []))
+        else:
+            texts = []
+        if texts:
+            return texts
+        raise ValueError(
+            f"{path} must contain a list of strings or objects with `text`/`content` fields."
+        )
+
+    if suffix == ".jsonl":
+        texts: list[str] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                texts.extend(_normalize_text_entries([payload]))
+        if texts:
+            return texts
+        raise ValueError(
+            f"{path} must contain JSONL rows with a string, or `text`/`content` fields."
+        )
+
+    raw_text = path.read_text(encoding="utf-8")
+    texts = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if texts:
+        return texts
+    raise ValueError(f"No usable text entries were found in {path}.")
+
+
 def _conversation_to_raw(record: ConversationRecord) -> dict[str, Any]:
     return {
         "conversation_id": record.conversation_id,
@@ -469,6 +993,16 @@ def split_records(
         return {"train": train_split, "val": val_split, "test": test_split}
     val_split, _ = stratified_sample(remainder, val_count, seed=seed + 1)
     return {"train": train_split, "val": val_split}
+
+
+def shuffle_records(
+    records: Sequence[ConversationRecord],
+    *,
+    seed: int,
+) -> list[ConversationRecord]:
+    shuffled = list(records)
+    random.Random(seed).shuffle(shuffled)
+    return shuffled
 
 
 def _ratio_split_counts(
@@ -713,138 +1247,309 @@ def _load_base_tokenizer(model_name: str) -> PreTrainedTokenizerBase:
     return tokenizer
 
 
+def _uniform_weights(count: int) -> list[float]:
+    if count <= 0:
+        return []
+    return [1.0 / count] * count
+
+
+def _normalize_similarity_surface(surface: str) -> str:
+    normalized = " ".join(surface.strip().lower().split())
+    return normalized
+
+
+def _char_ngrams(
+    surface: str,
+    *,
+    min_n: int = 2,
+    max_n: int = 4,
+) -> set[str]:
+    normalized = _normalize_similarity_surface(surface)
+    if not normalized:
+        return set()
+    padded = f"^{normalized}$"
+    grams: set[str] = set()
+    for n in range(min_n, max_n + 1):
+        if len(padded) < n:
+            continue
+        for index in range(len(padded) - n + 1):
+            grams.add(padded[index : index + n])
+    if not grams:
+        grams.add(padded)
+    return grams
+
+
+def _candidate_source_counts(
+    tokenizer: PreTrainedTokenizerBase,
+    texts: Sequence[str],
+) -> Counter[int]:
+    counts: Counter[int] = Counter()
+    for text in texts:
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        counts.update(_strip_whitespace_only_ids(tokenizer, token_ids))
+    return counts
+
+
+def _build_overlap_neighbor_index(
+    tokenizer: PreTrainedTokenizerBase,
+    texts: Sequence[str],
+) -> tuple[list[dict[str, Any]], dict[str, float], dict[str, list[int]]]:
+    counts = _candidate_source_counts(tokenizer, texts)
+    special_ids = set(tokenizer.all_special_ids)
+    entries: list[dict[str, Any]] = []
+    for token_id, frequency in sorted(counts.items()):
+        if token_id in special_ids:
+            continue
+        token = tokenizer.convert_ids_to_tokens(int(token_id))
+        surface = _token_to_surface(tokenizer, token)
+        normalized = _normalize_similarity_surface(surface)
+        if len(normalized) < 2:
+            continue
+        ngrams = _char_ngrams(normalized)
+        if not ngrams:
+            continue
+        entries.append(
+            {
+                "token_id": int(token_id),
+                "token": token,
+                "surface": surface,
+                "frequency": int(frequency),
+                "ngrams": ngrams,
+            }
+        )
+
+    document_frequency: Counter[str] = Counter()
+    for entry in entries:
+        document_frequency.update(entry["ngrams"])
+    total_entries = max(1, len(entries))
+    idf = {
+        ngram: math.log((1.0 + total_entries) / (1.0 + frequency)) + 1.0
+        for ngram, frequency in document_frequency.items()
+    }
+    inverted_index: dict[str, list[int]] = defaultdict(list)
+    for index, entry in enumerate(entries):
+        norm = math.sqrt(sum(idf[ngram] ** 2 for ngram in entry["ngrams"]))
+        entry["norm"] = norm
+        for ngram in entry["ngrams"]:
+            inverted_index[ngram].append(index)
+    return entries, idf, inverted_index
+
+
+def _top_overlap_neighbors(
+    surface: str,
+    *,
+    entries: Sequence[dict[str, Any]],
+    idf: dict[str, float],
+    inverted_index: dict[str, list[int]],
+    top_k: int = 4,
+    min_score: float = 0.2,
+) -> list[dict[str, Any]]:
+    ngrams = _char_ngrams(surface)
+    weighted_ngrams = {ngram: idf[ngram] for ngram in ngrams if ngram in idf}
+    if not weighted_ngrams:
+        return []
+
+    target_norm = math.sqrt(sum(weight ** 2 for weight in weighted_ngrams.values()))
+    if target_norm <= 0.0:
+        return []
+
+    dot_scores: dict[int, float] = defaultdict(float)
+    for ngram, weight in weighted_ngrams.items():
+        for entry_index in inverted_index.get(ngram, []):
+            dot_scores[entry_index] += weight * weight
+
+    neighbors: list[dict[str, Any]] = []
+    for entry_index, dot_product in dot_scores.items():
+        entry = entries[entry_index]
+        denominator = target_norm * float(entry.get("norm", 0.0))
+        if denominator <= 0.0:
+            continue
+        score = dot_product / denominator
+        if score < min_score:
+            continue
+        neighbors.append(
+            {
+                "token_id": int(entry["token_id"]),
+                "token": entry["token"],
+                "surface": entry["surface"],
+                "score": float(score),
+                "frequency": int(entry["frequency"]),
+            }
+        )
+
+    neighbors.sort(key=lambda item: (item["score"], item["frequency"]), reverse=True)
+    return neighbors[:top_k]
+
+
+def _build_unigram_tokenizer(
+    *,
+    base_tokenizer: PreTrainedTokenizerBase,
+    training_texts: Sequence[str],
+    vocab_size: int,
+) -> PreTrainedTokenizerFast:
+    unk_token = base_tokenizer.unk_token or "<unk>"
+    special_tokens: list[str] = [unk_token]
+    for token in base_tokenizer.all_special_tokens:
+        if token not in special_tokens:
+            special_tokens.append(token)
+
+    tokenizer_backend = SentencePieceUnigramTokenizer()
+    tokenizer_backend.train_from_iterator(
+        training_texts,
+        vocab_size=vocab_size,
+        show_progress=False,
+        special_tokens=special_tokens,
+        unk_token=unk_token,
+    )
+
+    tokenizer_kwargs: dict[str, Any] = {
+        "tokenizer_object": tokenizer_backend,
+        "unk_token": unk_token,
+    }
+    if base_tokenizer.pad_token is not None:
+        tokenizer_kwargs["pad_token"] = base_tokenizer.pad_token
+    if base_tokenizer.eos_token is not None:
+        tokenizer_kwargs["eos_token"] = base_tokenizer.eos_token
+    if base_tokenizer.bos_token is not None:
+        tokenizer_kwargs["bos_token"] = base_tokenizer.bos_token
+
+    occupied_special_tokens = {
+        value
+        for value in (
+            tokenizer_kwargs.get("unk_token"),
+            tokenizer_kwargs.get("pad_token"),
+            tokenizer_kwargs.get("eos_token"),
+            tokenizer_kwargs.get("bos_token"),
+        )
+        if value is not None
+    }
+    additional_special_tokens = [
+        token
+        for token in special_tokens
+        if token not in occupied_special_tokens
+    ]
+    if additional_special_tokens:
+        tokenizer_kwargs["additional_special_tokens"] = additional_special_tokens
+
+    tokenizer = PreTrainedTokenizerFast(**tokenizer_kwargs)
+    tokenizer.padding_side = "right"
+    tokenizer.chat_template = getattr(base_tokenizer, "chat_template", None)
+    tokenizer.model_max_length = base_tokenizer.model_max_length
+    return tokenizer
+
+
+def _build_reference_bpe_tokenizer(
+    training_texts: Sequence[str],
+    *,
+    vocab_size: int,
+) -> BackendTokenizer:
+    tokenizer = BackendTokenizer(models.BPE(unk_token="<unk>"))
+    tokenizer.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    trainer = trainers.BpeTrainer(
+        vocab_size=max(256, vocab_size),
+        min_frequency=2,
+        show_progress=False,
+        special_tokens=["<unk>"],
+    )
+    tokenizer.train_from_iterator(training_texts, trainer=trainer)
+    return tokenizer
+
+
+def _backend_piece_count(tokenizer: BackendTokenizer, surface: str) -> int:
+    normalized = surface.strip()
+    if not normalized:
+        return 0
+    return len(tokenizer.encode(normalized).ids)
+
+
+def _weighted_fragment_mean(
+    word_counts: Counter[str],
+    piece_count_fn: Callable[[str], int],
+) -> float:
+    total_frequency = 0
+    total_fragments = 0.0
+    for word, frequency in word_counts.items():
+        if frequency <= 0:
+            continue
+        fragment_count = max(1, int(piece_count_fn(word)))
+        total_frequency += int(frequency)
+        total_fragments += float(frequency) * fragment_count
+    if total_frequency == 0:
+        return 1.0
+    return total_fragments / total_frequency
+
+
 def build_method_a_adaptation(
     model_name: str,
     *,
-    assistant_texts: Sequence[str],
+    training_texts: Sequence[str],
     token_budget: int,
+    reference_bpe_vocab_size: int,
     output_dir: Path,
 ) -> TokenizerAdaptation:
     base_tokenizer = _load_base_tokenizer(model_name)
     word_counts: Counter[str] = Counter()
-    for text in assistant_texts:
+    for text in training_texts:
         word_counts.update(_extract_words(text))
+    if not word_counts:
+        raise ValueError("Method A needs at least one Wolof word in the training texts.")
+
+    reference_bpe = _build_reference_bpe_tokenizer(
+        training_texts,
+        vocab_size=reference_bpe_vocab_size,
+    )
+    reference_fragment_threshold = _weighted_fragment_mean(
+        word_counts,
+        lambda word: _backend_piece_count(reference_bpe, word),
+    )
+    base_fragment_mean = _weighted_fragment_mean(
+        word_counts,
+        lambda word: len(_best_piece_ids(base_tokenizer, word)),
+    )
 
     word_candidates: list[dict[str, Any]] = []
     for word, frequency in word_counts.items():
         if len(word) < 3 or frequency < 2:
             continue
         source_ids = _best_piece_ids(base_tokenizer, word)
-        if len(source_ids) <= 1:
+        fragment_count = len(source_ids)
+        if fragment_count <= reference_fragment_threshold:
             continue
+        reference_fragment_count = max(1, _backend_piece_count(reference_bpe, word))
+        fragmentation_gap = fragment_count - reference_fragment_threshold
         word_candidates.append(
             {
                 "token": word,
                 "token_type": "word",
-                "frequency": frequency,
-                "fragment_count": len(source_ids),
-                "score": frequency * (len(source_ids) - 1),
-                "source_ids": source_ids,
-            }
-        )
-
-    prefix_counts: Counter[str] = Counter()
-    suffix_counts: Counter[str] = Counter()
-    prefix_words: dict[str, set[str]] = defaultdict(set)
-    suffix_words: dict[str, set[str]] = defaultdict(set)
-    for word, frequency in word_counts.items():
-        if len(word) < 5:
-            continue
-        if len(_best_piece_ids(base_tokenizer, word)) <= 1:
-            continue
-        for length in range(3, min(8, len(word) - 1) + 1):
-            prefix = word[:length]
-            suffix = word[-length:]
-            prefix_counts[prefix] += frequency
-            suffix_counts[suffix] += frequency
-            prefix_words[prefix].add(word)
-            suffix_words[suffix].add(word)
-
-    morph_candidates: list[dict[str, Any]] = []
-    for token, frequency in prefix_counts.items():
-        if len(prefix_words[token]) < 3 or frequency < 6:
-            continue
-        source_ids = _best_piece_ids(base_tokenizer, token)
-        if len(source_ids) <= 1:
-            continue
-        morph_candidates.append(
-            {
-                "token": token,
-                "token_type": "prefix",
-                "frequency": frequency,
-                "fragment_count": len(source_ids),
-                "score": frequency * (len(source_ids) - 1),
-                "source_ids": source_ids,
-            }
-        )
-    for token, frequency in suffix_counts.items():
-        if len(suffix_words[token]) < 3 or frequency < 6:
-            continue
-        source_ids = _best_piece_ids(base_tokenizer, token)
-        if len(source_ids) <= 1:
-            continue
-        morph_candidates.append(
-            {
-                "token": token,
-                "token_type": "suffix",
-                "frequency": frequency,
-                "fragment_count": len(source_ids),
-                "score": frequency * (len(source_ids) - 1),
+                "frequency": int(frequency),
+                "fragment_count": fragment_count,
+                "reference_fragment_count": reference_fragment_count,
+                "fragmentation_gap": float(fragmentation_gap),
+                "score": float(frequency) * float(fragmentation_gap),
                 "source_ids": source_ids,
             }
         )
 
     word_candidates.sort(
-        key=lambda item: (item["score"], item["frequency"], item["token"]),
-        reverse=True,
-    )
-    morph_candidates.sort(
-        key=lambda item: (item["score"], item["frequency"], item["token"]),
+        key=lambda item: (
+            item["score"],
+            item["frequency"],
+            item["fragment_count"],
+            item["token"],
+        ),
         reverse=True,
     )
 
     tokenizer = _load_base_tokenizer(model_name)
-    word_quota = max(1, int(token_budget * 0.7))
-    morph_quota = max(0, token_budget - word_quota)
-    selected: list[dict[str, Any]] = []
-    seen_tokens: set[str] = set()
-
-    def _take(candidates: Sequence[dict[str, Any]], limit: int) -> None:
-        for candidate in candidates:
-            if len(selected) >= token_budget or limit <= 0:
-                break
-            token = candidate["token"]
-            if token in seen_tokens:
-                continue
-            selected.append(candidate)
-            seen_tokens.add(token)
-            limit -= 1
-
-    _take(word_candidates, word_quota)
-    _take(morph_candidates, morph_quota)
-    if len(selected) < token_budget:
-        combined = sorted(
-            [*word_candidates, *morph_candidates],
-            key=lambda item: (item["score"], item["frequency"], item["token"]),
-            reverse=True,
-        )
-        for candidate in combined:
-            if len(selected) >= token_budget:
-                break
-            token = candidate["token"]
-            if token in seen_tokens:
-                continue
-            selected.append(candidate)
-            seen_tokens.add(token)
+    selected = word_candidates[:token_budget]
 
     added_tokens = []
     for candidate in selected:
-        token_type = candidate["token_type"]
         added_tokens.append(
             AddedToken(
                 candidate["token"],
-                single_word=token_type == "word",
-                lstrip=token_type == "word",
+                single_word=True,
+                lstrip=True,
                 normalized=False,
             )
         )
@@ -854,6 +1559,7 @@ def build_method_a_adaptation(
     tokenizer.save_pretrained(str(tokenizer_dir))
 
     embedding_sources: dict[int, list[int]] = {}
+    embedding_source_weights: dict[int, list[float]] = {}
     metric_token_ids: list[int] = []
     selected_metadata = []
     for candidate in selected:
@@ -861,6 +1567,7 @@ def build_method_a_adaptation(
         token_id = int(tokenizer.convert_tokens_to_ids(token))
         source_ids = list(candidate["source_ids"])
         embedding_sources[token_id] = source_ids
+        embedding_source_weights[token_id] = _uniform_weights(len(source_ids))
         metric_token_ids.append(token_id)
         selected_metadata.append(
             {
@@ -869,6 +1576,8 @@ def build_method_a_adaptation(
                 "token_type": candidate["token_type"],
                 "frequency": candidate["frequency"],
                 "fragment_count": candidate["fragment_count"],
+                "reference_fragment_count": candidate["reference_fragment_count"],
+                "fragmentation_gap": candidate["fragmentation_gap"],
                 "score": candidate["score"],
                 "source_ids": source_ids,
                 "source_tokens": base_tokenizer.convert_ids_to_tokens(source_ids),
@@ -878,11 +1587,15 @@ def build_method_a_adaptation(
     metadata = {
         "method": "method_a",
         "token_budget": token_budget,
+        "embedding_init_method": "uniform_average",
+        "reference_bpe_vocab_size": reference_bpe_vocab_size,
+        "fragmentation_threshold": reference_fragment_threshold,
+        "base_fragment_mean": base_fragment_mean,
         "selected_token_count": len(selected_metadata),
         "selected_tokens": selected_metadata,
         "candidate_summary": {
             "word_candidates": len(word_candidates),
-            "morpheme_candidates": len(morph_candidates),
+            "min_frequency": 2,
         },
     }
     _write_json_payload(output_dir / "token_selection.json", metadata)
@@ -892,6 +1605,7 @@ def build_method_a_adaptation(
         tokenizer=tokenizer,
         tokenizer_dir=tokenizer_dir,
         embedding_sources=embedding_sources,
+        embedding_source_weights=embedding_source_weights,
         metric_token_ids=metric_token_ids,
         initialize_all_token_ids=metric_token_ids,
         metadata=metadata,
@@ -974,6 +1688,154 @@ def build_method_b_adaptation(
         tokenizer=tokenizer,
         tokenizer_dir=tokenizer_dir,
         embedding_sources=embedding_sources,
+        embedding_source_weights={},
+        metric_token_ids=metric_token_ids,
+        initialize_all_token_ids=initialize_all_token_ids,
+        metadata=metadata,
+    )
+
+
+def build_method_c_adaptation(
+    model_name: str,
+    *,
+    training_texts: Sequence[str],
+    vocab_size: int,
+    output_dir: Path,
+) -> TokenizerAdaptation:
+    base_tokenizer = _load_base_tokenizer(model_name)
+    tokenizer = _build_unigram_tokenizer(
+        base_tokenizer=base_tokenizer,
+        training_texts=training_texts,
+        vocab_size=vocab_size,
+    )
+
+    tokenizer_dir = output_dir / "tokenizer"
+    tokenizer.save_pretrained(str(tokenizer_dir))
+
+    special_tokens = set(tokenizer.all_special_tokens)
+    neighbor_entries, idf, inverted_index = _build_overlap_neighbor_index(
+        base_tokenizer,
+        training_texts,
+    )
+
+    embedding_sources: dict[int, list[int]] = {}
+    embedding_source_weights: dict[int, list[float]] = {}
+    initialize_all_token_ids: list[int] = []
+    metric_token_ids: list[int] = []
+    init_plan: list[dict[str, Any]] = []
+
+    direct_overlap = 0
+    overlap_neighbor = 0
+    fallback_subpieces = 0
+    special_fallback = 0
+
+    special_fallback_ids = [
+        int(token_id)
+        for token_id in (
+            base_tokenizer.pad_token_id,
+            base_tokenizer.eos_token_id,
+        )
+        if token_id is not None
+    ]
+    if not special_fallback_ids:
+        special_fallback_ids = [0]
+
+    for token, token_id in sorted(tokenizer.get_vocab().items(), key=lambda item: item[1]):
+        token_id = int(token_id)
+        source_ids: list[int]
+        source_weights: list[float]
+        source_method: str
+        surface = _token_to_surface(tokenizer, token)
+        neighbor_details: list[dict[str, Any]] = []
+
+        if token == tokenizer.unk_token and token not in base_tokenizer.get_vocab():
+            source_ids = list(special_fallback_ids)
+            source_weights = _uniform_weights(len(source_ids))
+            source_method = "special_fallback"
+            special_fallback += 1
+        else:
+            direct_ids = _surface_piece_ids(base_tokenizer, surface)
+            if len(direct_ids) == 1:
+                source_ids = [int(direct_ids[0])]
+                source_weights = [1.0]
+                source_method = "direct_surface_overlap"
+                direct_overlap += 1
+            else:
+                neighbors = _top_overlap_neighbors(
+                    surface,
+                    entries=neighbor_entries,
+                    idf=idf,
+                    inverted_index=inverted_index,
+                )
+                if neighbors:
+                    source_ids = [int(item["token_id"]) for item in neighbors]
+                    raw_weights = [float(item["score"]) for item in neighbors]
+                    weight_sum = sum(raw_weights)
+                    source_weights = [
+                        weight / weight_sum for weight in raw_weights
+                    ] if weight_sum > 0.0 else _uniform_weights(len(raw_weights))
+                    source_method = "overlap_neighbor_convex"
+                    overlap_neighbor += 1
+                    neighbor_details = [
+                        {
+                            "token": item["token"],
+                            "token_id": item["token_id"],
+                            "surface": item["surface"],
+                            "score": item["score"],
+                            "weight": source_weights[index],
+                        }
+                        for index, item in enumerate(neighbors)
+                    ]
+                else:
+                    source_ids = direct_ids or _surface_piece_ids(base_tokenizer, token)
+                    if not source_ids:
+                        source_ids = list(special_fallback_ids)
+                        source_method = "special_fallback"
+                        special_fallback += 1
+                    else:
+                        source_method = "fallback_subpieces"
+                        fallback_subpieces += 1
+                    source_weights = _uniform_weights(len(source_ids))
+
+        embedding_sources[token_id] = list(source_ids)
+        embedding_source_weights[token_id] = list(source_weights)
+        initialize_all_token_ids.append(token_id)
+        if token not in special_tokens:
+            metric_token_ids.append(token_id)
+
+        init_plan.append(
+            {
+                "token": token,
+                "token_id": token_id,
+                "surface": surface,
+                "source_method": source_method,
+                "source_ids": source_ids,
+                "source_weights": source_weights,
+                "source_tokens": base_tokenizer.convert_ids_to_tokens(source_ids),
+                "neighbors": neighbor_details,
+            }
+        )
+
+    metadata = {
+        "method": "method_c",
+        "tokenizer_backend": "sentencepiece_unigram",
+        "target_vocab_size": vocab_size,
+        "actual_vocab_size": len(tokenizer),
+        "direct_surface_overlap_count": direct_overlap,
+        "overlap_neighbor_convex_count": overlap_neighbor,
+        "fallback_subpiece_count": fallback_subpieces,
+        "special_fallback_count": special_fallback,
+        "neighbor_candidate_count": len(neighbor_entries),
+        "init_plan": init_plan,
+    }
+    _write_json_payload(output_dir / "embedding_transfer_plan.json", metadata)
+
+    return TokenizerAdaptation(
+        name="method_c",
+        tokenizer=tokenizer,
+        tokenizer_dir=tokenizer_dir,
+        embedding_sources=embedding_sources,
+        embedding_source_weights=embedding_source_weights,
         metric_token_ids=metric_token_ids,
         initialize_all_token_ids=initialize_all_token_ids,
         metadata=metadata,
@@ -1075,7 +1937,13 @@ def _prepare_model(
         source_ids = adaptation.embedding_sources[token_id]
         if not source_ids:
             continue
-        source_input = old_input[source_ids].mean(dim=0)
+        source_weights = adaptation.embedding_source_weights.get(token_id, [])
+        valid_weights = len(source_weights) == len(source_ids) and bool(source_weights)
+        if valid_weights:
+            weight_tensor = torch.tensor(source_weights, dtype=torch.float32).unsqueeze(1)
+            source_input = (old_input[source_ids] * weight_tensor).sum(dim=0)
+        else:
+            source_input = old_input[source_ids].mean(dim=0)
         input_weight[token_id] = source_input.to(
             device=input_weight.device,
             dtype=input_weight.dtype,
@@ -1083,7 +1951,10 @@ def _prepare_model(
         if output_module is not None and not output_is_tied:
             source_output = source_input
             if old_output is not None:
-                source_output = old_output[source_ids].mean(dim=0)
+                if valid_weights:
+                    source_output = (old_output[source_ids] * weight_tensor).sum(dim=0)
+                else:
+                    source_output = old_output[source_ids].mean(dim=0)
             output_module.weight.data[token_id] = source_output.to(
                 device=output_module.weight.device,
                 dtype=output_module.weight.dtype,
@@ -1096,7 +1967,11 @@ def _prepare_model(
                 source_vectors,
                 dim=-1,
             )
-            mean_cosine = float(cosines.mean().item())
+            if valid_weights:
+                cosine_weights = torch.tensor(source_weights, dtype=torch.float32)
+                mean_cosine = float((cosines * cosine_weights).sum().item())
+            else:
+                mean_cosine = float(cosines.mean().item())
             similarity_scores[token_id] = mean_cosine
 
     model.tie_weights()
@@ -1158,6 +2033,95 @@ def _perplexity(eval_loss: float | None) -> float | None:
         return float(math.exp(eval_loss))
     except OverflowError:
         return float("inf")
+
+
+def _checkpoint_step(path: Path) -> int:
+    match = re.search(r"checkpoint-(\d+)$", path.name)
+    if match is None:
+        return math.inf
+    return int(match.group(1))
+
+
+def _load_json_object(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected {path} to contain a JSON object.")
+    return payload
+
+
+def _checkpoint_eval_entry(
+    trainer_state: dict[str, Any],
+    *,
+    global_step: int | None,
+) -> dict[str, Any] | None:
+    log_history = trainer_state.get("log_history")
+    if not isinstance(log_history, list):
+        return None
+    for item in reversed(log_history):
+        if not isinstance(item, dict):
+            continue
+        if "eval_loss" not in item:
+            continue
+        if global_step is None:
+            return item
+        item_step = item.get("step")
+        if isinstance(item_step, (int, float)) and int(item_step) == global_step:
+            return item
+    return None
+
+
+def _collect_epoch_checkpoint_summaries(model_dir: Path) -> dict[str, Any]:
+    checkpoint_dirs = sorted(
+        (
+            path
+            for path in model_dir.iterdir()
+            if path.is_dir() and path.name.startswith("checkpoint-")
+        ),
+        key=_checkpoint_step,
+    )
+    summaries: list[dict[str, Any]] = []
+    for fallback_index, checkpoint_dir in enumerate(checkpoint_dirs, start=1):
+        trainer_state_path = checkpoint_dir / "trainer_state.json"
+        if not trainer_state_path.exists():
+            continue
+        trainer_state = _load_json_object(trainer_state_path)
+        global_step_raw = trainer_state.get("global_step")
+        global_step = int(global_step_raw) if isinstance(global_step_raw, (int, float)) else None
+        epoch_raw = trainer_state.get("epoch")
+        epoch_float = float(epoch_raw) if isinstance(epoch_raw, (int, float)) else None
+        epoch = fallback_index
+        if epoch_float is not None:
+            rounded_epoch = round(epoch_float)
+            if math.isclose(epoch_float, rounded_epoch, rel_tol=0.0, abs_tol=1e-6):
+                epoch = max(1, int(rounded_epoch))
+        eval_entry = _checkpoint_eval_entry(trainer_state, global_step=global_step)
+        eval_loss_raw = None if eval_entry is None else eval_entry.get("eval_loss")
+        eval_loss = float(eval_loss_raw) if isinstance(eval_loss_raw, (int, float)) else None
+        summary = {
+            "epoch": epoch,
+            "epoch_float": epoch_float,
+            "global_step": global_step,
+            "checkpoint_name": checkpoint_dir.name,
+            "checkpoint_dir": str(checkpoint_dir),
+            "tokenizer_path": str(checkpoint_dir),
+            "trainer_state_file": str(trainer_state_path),
+            "eval_loss": eval_loss,
+            "perplexity": _perplexity(eval_loss),
+        }
+        _write_json_payload(checkpoint_dir / "epoch_summary.json", summary)
+        summaries.append(summary)
+
+    summaries.sort(
+        key=lambda item: (
+            int(item["epoch"]),
+            _checkpoint_step(Path(item["checkpoint_dir"])),
+        )
+    )
+    return {
+        "checkpoint_count": len(summaries),
+        "checkpoints": summaries,
+    }
 
 
 def _is_oom_error(exc: BaseException) -> bool:
@@ -1231,6 +2195,7 @@ def _train_once(
         warmup_steps=plan.warmup_steps,
         logging_steps=plan.logging_steps,
         save_strategy="epoch",
+        save_total_limit=max(1, int(math.ceil(plan.num_train_epochs))),
         eval_strategy="epoch",
         logging_strategy="steps",
         weight_decay=plan.weight_decay,
@@ -1258,6 +2223,8 @@ def _train_once(
     trainer.save_model(str(trainer_output_dir))
     trainer.save_state()
     adaptation.tokenizer.save_pretrained(str(trainer_output_dir))
+    epoch_checkpoint_summary = _collect_epoch_checkpoint_summaries(trainer_output_dir)
+    _write_json_payload(output_dir / "epoch_checkpoints.json", epoch_checkpoint_summary)
     sample_generations: list[dict[str, str]] = []
     if generation_records:
         sample_generations = _generate_samples_from_model(
@@ -1277,6 +2244,7 @@ def _train_once(
         "embedding_init_quality": model_metadata["embedding_init_quality"],
         "embedding_similarity_by_token_id": similarity_scores,
         "sample_generations": sample_generations,
+        "epoch_checkpoints": epoch_checkpoint_summary,
     }
     _write_json_payload(output_dir / "training_summary.json", train_summary)
     return train_summary
@@ -1420,6 +2388,7 @@ def _benchmark_method(
     method_name: str,
     model_name: str,
     benchmark_splits: dict[str, list[ConversationRecord]],
+    method_a_reference_texts: Sequence[str],
     profile: GpuProfile,
     token_budget: int,
     bpe_vocab_size: int,
@@ -1433,17 +2402,27 @@ def _benchmark_method(
     if method_name == "method_a":
         adaptation = build_method_a_adaptation(
             model_name,
-            assistant_texts=_assistant_texts(train_records),
+            training_texts=method_a_reference_texts,
             token_budget=token_budget,
+            reference_bpe_vocab_size=bpe_vocab_size,
             output_dir=output_dir,
         )
-    else:
+    elif method_name == "method_b":
         adaptation = build_method_b_adaptation(
             model_name,
             training_texts=_all_message_texts(train_records),
             vocab_size=bpe_vocab_size,
             output_dir=output_dir,
         )
+    elif method_name == "method_c":
+        adaptation = build_method_c_adaptation(
+            model_name,
+            training_texts=_all_message_texts(train_records),
+            vocab_size=bpe_vocab_size,
+            output_dir=output_dir,
+        )
+    else:
+        raise ValueError(f"Unsupported benchmark method: {method_name}")
 
     suggested_length = _suggest_max_length(
         [*train_records, *val_records],
@@ -1512,12 +2491,19 @@ def _build_markdown_report(
     output_dir: Path,
     gpu_profile: GpuProfile,
     model_name: str,
+    method_a_text_corpus_file: Path,
+    method_a_text_count: int,
     benchmark_results: Sequence[dict[str, Any]],
     winner: dict[str, Any],
     final_result: dict[str, Any],
     benchmark_splits: dict[str, list[ConversationRecord]],
     final_splits: dict[str, list[ConversationRecord]],
+    english_replay_metadata: dict[str, Any] | None,
+    math_replay_metadata: dict[str, Any] | None,
+    train_mix_metadata: dict[str, Any] | None,
+    final_train_record_count: int,
 ) -> str:
+    method_names = {result["method"] for result in benchmark_results}
     benchmark_rows = "\n".join(
         [
             "| {method} | {fertility} | {coverage} | {embedding} | {perplexity} |".format(
@@ -1572,7 +2558,7 @@ def _build_markdown_report(
     )
     runtime_strategy_line = (
         "- Fine-tuning uses packed full-parameter BF16 training on the "
-        "detected high-memory GPU so the 1k tokenizer benchmark and 5k "
+        "detected high-memory GPU so the tokenizer benchmark and final "
         "follow-up run finish with much higher throughput."
         if gpu_profile.training_strategy == "full" and gpu_profile.full_packing
         else "- Fine-tuning uses full-parameter training because the "
@@ -1583,46 +2569,126 @@ def _build_markdown_report(
         "because it is the reliable path with checkpointing and enough "
         "headroom for tokenizer resizing and validation."
     )
-    research_lines = "\n".join(
-        [
-            "- Tokenizer quality is measured with intrinsic metrics",
-            "  (fertility, coverage) and downstream loss because",
-            "  tokenizer studies show fragmentation metrics alone do",
-            "  not fully predict task performance.",
-            "- Method A keeps Qwen's base vocabulary and augments it",
-            "  with high-frequency over-fragmented Wolof words and",
-            "  affix-like morphemes so English coverage and chat",
-            "  special tokens remain stable.",
-            "- Method B trains a compact tokenizer on the Wolof",
-            "  corpus and initializes each token by direct overlap or",
-            "  compositional averaging from the original Qwen",
-            "  subword space instead of random rows.",
-            runtime_strategy_line,
-        ]
-    )
-    reference_lines = "\n".join(
-        [
-            "- Rust et al. (2021), *How Good Is Your Tokenizer?*",
-            "  https://aclanthology.org/2021.acl-long.243/",
-            "- Dobler et al. (2024), *FOCUS: Effective Embedding",
-            "  Initialization for Special Tokens and Embeddings in",
-            "  Fine-Tuned Language Models*",
-            "  https://arxiv.org/abs/2305.14481",
-            "- Dettmers et al. (2023), *QLoRA: Efficient Finetuning",
-            "  of Quantized LLMs*",
-            "  https://arxiv.org/abs/2305.14314",
-            "- Chau et al. (2024), *Tokenizer Choice For LLM Training:",
-            "  Negligible or Crucial?*",
-            "  https://arxiv.org/abs/2405.17886",
-        ]
-    )
+    research_sections = [
+        "- Tokenizer quality is measured with intrinsic metrics",
+        "  (fertility, coverage) and downstream loss because",
+        "  tokenizer studies show fragmentation metrics alone do",
+        "  not fully predict task performance.",
+        "- Method A keeps Qwen's base vocabulary and augments it",
+        "  with high-frequency Wolof words mined from a separate",
+        "  text-only corpus, keeps only the ones whose Qwen",
+        "  fragmentation exceeds a Wolof-BPE reference threshold,",
+        "  then initializes each added token by averaging the",
+        "  original Qwen subword embeddings.",
+        "- Method B trains a compact tokenizer on the Wolof",
+        "  corpus and initializes each token by direct overlap or",
+        "  compositional averaging from the original Qwen",
+        "  subword space instead of random rows.",
+    ]
+    if "method_c" in method_names:
+        research_sections.extend(
+            [
+                "- Method C trains a SentencePiece-style Unigram",
+                "  tokenizer on the Wolof corpus and initializes new",
+                "  rows with a convex mixture of lexically similar",
+                "  source-token embeddings, which is a practical",
+                "  overlap-based transfer variant inspired by FOCUS",
+                "  and convex-hull initialization work.",
+            ]
+        )
+    research_sections.append(runtime_strategy_line)
+    research_lines = "\n".join(research_sections)
+
+    reference_sections = [
+        "- Rust et al. (2021), *How Good Is Your Tokenizer?*",
+        "  https://aclanthology.org/2021.acl-long.243/",
+        "- Dobler et al. (2024), *FOCUS: Effective Embedding",
+        "  Initialization for Special Tokens and Embeddings in",
+        "  Fine-Tuned Language Models*",
+        "  https://arxiv.org/abs/2305.14481",
+        "- Dettmers et al. (2023), *QLoRA: Efficient Finetuning",
+        "  of Quantized LLMs*",
+        "  https://arxiv.org/abs/2305.14314",
+        "- Chau et al. (2024), *Tokenizer Choice For LLM Training:",
+        "  Negligible or Crucial?*",
+        "  https://arxiv.org/abs/2405.17886",
+    ]
+    if "method_c" in method_names:
+        reference_sections.extend(
+            [
+                "- Kudo and Richardson (2018), *SentencePiece:*",
+                "  https://aclanthology.org/D18-2012/",
+                "- Bostrom and Durrett (2020), *Byte Pair Encoding is",
+                "  Suboptimal for Language Model Pretraining*",
+                "  https://aclanthology.org/2020.findings-emnlp.414/",
+                "- Mundra et al. (2024), *An Empirical Comparison of",
+                "  Vocabulary Expansion and Initialization Approaches",
+                "  for Language Models*",
+                "  https://arxiv.org/abs/2406.17827",
+            ]
+        )
+    reference_lines = "\n".join(reference_sections)
     recommendation_line = (
         "this method achieved the best validation perplexity on the held-out "
         "benchmark split. The secondary checks on fertility, single-token "
         "coverage, and embedding initialization quality also stayed "
-        "competitive enough to make it the safer choice for the larger 5k "
+        "competitive enough to make it the safer choice for the larger "
         "fine-tune."
     )
+    replay_lines: list[str] = []
+
+    def _append_replay_lines(
+        label: str,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        if not metadata or not metadata.get("enabled"):
+            replay_lines.append(f"- {label} replay mix: disabled")
+            return
+        replay_source = metadata["source"]
+        if metadata.get("config_name"):
+            replay_source = f"{replay_source} ({metadata['config_name']})"
+        if metadata.get("split"):
+            replay_source = f"{replay_source}, split={metadata['split']}"
+
+        ratio_label = "n/a"
+        if metadata.get("mix_ratio") is not None:
+            ratio_label = f"{100.0 * float(metadata['mix_ratio']):.1f}% target train mix"
+        elif metadata.get("sample_ratio") is not None:
+            ratio_label = f"{100.0 * float(metadata['sample_ratio']):.1f}% of --full-samples"
+
+        replay_lines.extend(
+            [
+                f"- {label} replay source: `{replay_source}`",
+                f"- {label} replay sample size: "
+                f"{metadata.get('loaded_sample_size', 0)} conversations ({ratio_label})",
+            ]
+        )
+
+    _append_replay_lines("English", english_replay_metadata)
+    _append_replay_lines("Math", math_replay_metadata)
+
+    if train_mix_metadata and train_mix_metadata.get("mode") == "exact_train_mix":
+        target_ratios = train_mix_metadata.get("target_ratios", {})
+        actual_counts = train_mix_metadata.get("actual_counts", {})
+        replay_lines.extend(
+            [
+                "- Target final train mix: "
+                f"Wolof {100.0 * float(target_ratios.get('wolof', 0.0)):.1f}% / "
+                f"English {100.0 * float(target_ratios.get('english', 0.0)):.1f}% / "
+                f"Math {100.0 * float(target_ratios.get('math', 0.0)):.1f}%",
+                "- Actual final train counts: "
+                f"Wolof {actual_counts.get('wolof', 0)}, "
+                f"English {actual_counts.get('english', 0)}, "
+                f"Math {actual_counts.get('math', 0)}",
+            ]
+        )
+    replay_lines.extend(
+        [
+            f"- Final mixed train size: {final_train_record_count} conversations",
+            "- Validation split remains Wolof-only so the final metric stays target-focused.",
+        ]
+    )
+    replay_block = "\n".join(replay_lines)
 
     report = f"""# Wolof Qwen 2.5 Fine-Tuning Report
 
@@ -1652,11 +2718,15 @@ def _build_markdown_report(
 
 - Benchmark sample size: {benchmark_sample_total} conversations
 - Benchmark split: {benchmark_split_line}
-- Full-train sample size: {full_sample_total} conversations
-- Full split: {full_split_line}
+- Wolof full-pool sample size: {full_sample_total} conversations
+- Wolof full split: {full_split_line}
 - Stratification: turn-count bucket plus conversation-length quartile
+- Method A reference text corpus: `{method_a_text_corpus_file}`
+- Method A reference text entries: {method_a_text_count}
+- Final-stage replay policy: mix optional English and math replay only into
+  the final training set, not the tokenizer benchmark
 - Tokenizer rebuild policy for Step 2: reuse the winning adaptation
-  method and rebuild it on the 5k training corpus only, which avoids
+  method and rebuild it on the Wolof training corpus only, which avoids
   validation leakage while keeping the winning tokenizer strategy fixed
 
 ## Tokenizer Comparison
@@ -1677,6 +2747,7 @@ def _build_markdown_report(
 - Final validation perplexity: {_format_float(final_result['perplexity'], 4)}
 - Training plan: `{json.dumps(final_result['training_plan'], sort_keys=True)}`
 - Parameter counts: `{json.dumps(final_result['parameter_counts'], sort_keys=True)}`
+{replay_block}
 
 ## Sample Generations
 
@@ -1686,6 +2757,7 @@ def _build_markdown_report(
 
 - Benchmark summary: `{output_dir / "benchmark" / "comparison.json"}`
 - Final summary: `{output_dir / "final" / "final_result.json"}`
+- Epoch checkpoints: `{output_dir / "final" / "epoch_checkpoints.json"}`
 - Final generations: `{output_dir / "final" / "sample_generations.json"}`
 - Trainer outputs: `{output_dir / "final" / "model"}`
 
@@ -1704,6 +2776,20 @@ def _build_markdown_report(
 def run_wolof_pipeline(
     *,
     dataset_file: Path = Path("data/wolof-dataset/curated_dataset.json"),
+    method_a_text_corpus_file: Path | None = None,
+    english_replay_dataset: str | None = None,
+    english_replay_config: str | None = None,
+    english_replay_split: str = "train_sft",
+    english_replay_sample_ratio: float = 0.2,
+    english_replay_cache_dir: Path | None = None,
+    math_replay_dataset: str | None = None,
+    math_replay_config: str | None = None,
+    math_replay_split: str = "train",
+    math_replay_sample_ratio: float = 0.0,
+    math_replay_cache_dir: Path | None = None,
+    wolof_mix_ratio: float | None = None,
+    english_mix_ratio: float | None = None,
+    math_mix_ratio: float | None = None,
     output_root: Path = Path("outputs/wolof"),
     model_name: str = DEFAULT_MODEL_NAME,
     benchmark_sample_size: int = 1000,
@@ -1713,6 +2799,7 @@ def run_wolof_pipeline(
     full_bpe_vocab_size: int = 16384,
     benchmark_epochs: int = 3,
     full_epochs: int = 3,
+    include_method_c: bool = False,
     seed: int = 3407,
 ) -> dict[str, Any]:
     set_seed(seed)
@@ -1720,6 +2807,20 @@ def run_wolof_pipeline(
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+    if full_epochs < 1:
+        raise ValueError("Final fine-tuning requires at least 1 epoch.")
+    if full_epochs > 3:
+        raise ValueError(
+            "Final fine-tuning is capped at 3 epochs so epoch checkpoints stay "
+            "manageable for downstream benchmarking."
+        )
+    if method_a_text_corpus_file is None:
+        raise ValueError(
+            "Method A now requires a separate text-only corpus. "
+            "Pass --method-a-text-corpus-file <path>."
+        )
+    _validate_sample_ratio("English replay sample ratio", english_replay_sample_ratio)
+    _validate_sample_ratio("Math replay sample ratio", math_replay_sample_ratio)
 
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_dir = output_root / run_id
@@ -1733,6 +2834,14 @@ def run_wolof_pipeline(
     )
 
     records = load_wolof_dataset(dataset_file)
+    method_a_reference_texts = load_text_corpus(method_a_text_corpus_file)
+    _write_json_payload(
+        output_dir / "method_a_text_corpus.json",
+        {
+            "path": str(method_a_text_corpus_file),
+            "text_count": len(method_a_reference_texts),
+        },
+    )
     benchmark_pool, remaining = stratified_sample(records, benchmark_sample_size, seed=seed)
     benchmark_counts = _ratio_split_counts(
         benchmark_sample_size,
@@ -1759,6 +2868,129 @@ def run_wolof_pipeline(
         val_count=full_counts["val"],
         seed=seed + 111,
     )
+    exact_mix_sample_sizes = _resolve_exact_mix_sample_sizes(
+        wolof_train_size=len(full_splits["train"]),
+        wolof_mix_ratio=wolof_mix_ratio,
+        english_mix_ratio=english_mix_ratio,
+        math_mix_ratio=math_mix_ratio,
+    )
+    if exact_mix_sample_sizes is not None:
+        if exact_mix_sample_sizes["english"] > 0 and english_replay_dataset is None:
+            raise ValueError(
+                "Exact mix mode requires --english-replay-dataset when "
+                "--english-mix-ratio is greater than 0."
+            )
+        if exact_mix_sample_sizes["math"] > 0 and math_replay_dataset is None:
+            raise ValueError(
+                "Exact mix mode requires --math-replay-dataset when "
+                "--math-mix-ratio is greater than 0."
+            )
+
+    english_replay_records: list[ConversationRecord] = []
+    english_replay_metadata: dict[str, Any] | None = None
+    english_requested_sample_size = 0
+    if exact_mix_sample_sizes is not None:
+        english_requested_sample_size = exact_mix_sample_sizes["english"]
+    elif english_replay_dataset is not None and english_replay_sample_ratio > 0.0:
+        english_requested_sample_size = max(
+            1,
+            int(round(full_sample_size * english_replay_sample_ratio)),
+        )
+    if english_replay_dataset is not None and english_requested_sample_size > 0:
+        english_replay_records, english_replay_metadata = load_replay_dataset(
+            english_replay_dataset,
+            config_name=english_replay_config,
+            split=english_replay_split,
+            sample_size=english_requested_sample_size,
+            cache_dir=english_replay_cache_dir,
+            seed=seed + 121,
+        )
+        english_replay_metadata = {
+            **english_replay_metadata,
+            "sample_ratio": (
+                None if exact_mix_sample_sizes is not None else english_replay_sample_ratio
+            ),
+            "mix_ratio": english_mix_ratio,
+            "wolof_full_sample_size": full_sample_size,
+            "wolof_train_size": len(full_splits["train"]),
+        }
+        _write_json_payload(output_dir / "english_replay_dataset.json", english_replay_metadata)
+
+    math_replay_records: list[ConversationRecord] = []
+    math_replay_metadata: dict[str, Any] | None = None
+    math_requested_sample_size = 0
+    if exact_mix_sample_sizes is not None:
+        math_requested_sample_size = exact_mix_sample_sizes["math"]
+    elif math_replay_dataset is not None and math_replay_sample_ratio > 0.0:
+        math_requested_sample_size = max(
+            1,
+            int(round(full_sample_size * math_replay_sample_ratio)),
+        )
+    if math_replay_dataset is not None and math_requested_sample_size > 0:
+        math_replay_records, math_replay_metadata = load_replay_dataset(
+            math_replay_dataset,
+            config_name=math_replay_config,
+            split=math_replay_split,
+            sample_size=math_requested_sample_size,
+            cache_dir=math_replay_cache_dir,
+            seed=seed + 122,
+        )
+        math_replay_metadata = {
+            **math_replay_metadata,
+            "sample_ratio": (
+                None if exact_mix_sample_sizes is not None else math_replay_sample_ratio
+            ),
+            "mix_ratio": math_mix_ratio,
+            "wolof_full_sample_size": full_sample_size,
+            "wolof_train_size": len(full_splits["train"]),
+        }
+        _write_json_payload(output_dir / "math_replay_dataset.json", math_replay_metadata)
+
+    final_train_records = list(full_splits["train"])
+    if english_replay_records or math_replay_records:
+        final_train_records = shuffle_records(
+            [*final_train_records, *english_replay_records, *math_replay_records],
+            seed=seed + 131,
+        )
+        if english_replay_metadata is not None:
+            english_replay_metadata = {
+                **english_replay_metadata,
+                "wolof_val_size": len(full_splits["val"]),
+                "mixed_train_size": len(final_train_records),
+            }
+            _write_json_payload(output_dir / "english_replay_dataset.json", english_replay_metadata)
+        if math_replay_metadata is not None:
+            math_replay_metadata = {
+                **math_replay_metadata,
+                "wolof_val_size": len(full_splits["val"]),
+                "mixed_train_size": len(final_train_records),
+            }
+            _write_json_payload(output_dir / "math_replay_dataset.json", math_replay_metadata)
+
+    train_mix_metadata = {
+        "mode": (
+            "exact_train_mix"
+            if exact_mix_sample_sizes is not None
+            else "append_replay_sample_ratio"
+        ),
+        "target_ratios": (
+            {
+                "wolof": float(wolof_mix_ratio),
+                "english": float(english_mix_ratio),
+                "math": float(math_mix_ratio),
+            }
+            if exact_mix_sample_sizes is not None
+            else None
+        ),
+        "actual_counts": {
+            "wolof": len(full_splits["train"]),
+            "english": len(english_replay_records),
+            "math": len(math_replay_records),
+        },
+        "wolof_val_size": len(full_splits["val"]),
+        "mixed_train_size": len(final_train_records),
+    }
+    _write_json_payload(output_dir / "train_mix.json", train_mix_metadata)
 
     _write_json_payload(
         output_dir / "data_splits.json",
@@ -1774,13 +3006,18 @@ def run_wolof_pipeline(
         },
     )
 
+    benchmark_methods = ["method_a", "method_b"]
+    if include_method_c:
+        benchmark_methods.append("method_c")
+
     benchmark_results = []
-    for method_name in ("method_a", "method_b"):
+    for method_name in benchmark_methods:
         method_dir = benchmark_dir / method_name
         result = _benchmark_method(
             method_name=method_name,
             model_name=model_name,
             benchmark_splits=benchmark_splits,
+            method_a_reference_texts=method_a_reference_texts,
             profile=gpu_profile,
             token_budget=token_budget,
             bpe_vocab_size=benchmark_bpe_vocab_size,
@@ -1800,27 +3037,37 @@ def run_wolof_pipeline(
     if winner["method"] == "method_a":
         final_adaptation = build_method_a_adaptation(
             model_name,
-            assistant_texts=_assistant_texts(full_splits["train"]),
+            training_texts=method_a_reference_texts,
             token_budget=token_budget,
+            reference_bpe_vocab_size=full_bpe_vocab_size,
             output_dir=final_dir,
         )
-    else:
+    elif winner["method"] == "method_b":
         final_adaptation = build_method_b_adaptation(
             model_name,
             training_texts=_all_message_texts(full_splits["train"]),
             vocab_size=full_bpe_vocab_size,
             output_dir=final_dir,
         )
+    elif winner["method"] == "method_c":
+        final_adaptation = build_method_c_adaptation(
+            model_name,
+            training_texts=_all_message_texts(full_splits["train"]),
+            vocab_size=full_bpe_vocab_size,
+            output_dir=final_dir,
+        )
+    else:
+        raise ValueError(f"Unsupported winning method: {winner['method']}")
 
     final_max_length = _suggest_max_length(
-        [*full_splits["train"], *full_splits["val"]],
+        [*final_train_records, *full_splits["val"]],
         final_adaptation.tokenizer,
         cap=gpu_profile.full_max_length_cap,
     )
     final_plan = _build_training_plan(
         gpu_profile,
         benchmark=False,
-        train_size=len(full_splits["train"]),
+        train_size=len(final_train_records),
         num_train_epochs=full_epochs,
         max_length=final_max_length,
     )
@@ -1828,7 +3075,7 @@ def run_wolof_pipeline(
     final_train_summary = train_with_fallback(
         model_name=model_name,
         adaptation=final_adaptation,
-        train_records=full_splits["train"],
+        train_records=final_train_records,
         eval_records=full_splits["val"],
         plan=final_plan,
         output_dir=final_dir,
@@ -1845,6 +3092,7 @@ def run_wolof_pipeline(
         "eval_loss": final_eval_loss,
         "perplexity": _perplexity(final_eval_loss),
         "loss_curves": final_train_summary["loss_curves"],
+        "epoch_checkpoints": final_train_summary["epoch_checkpoints"],
         "attempts": final_train_summary["attempts"],
         "sample_generations": sample_generations,
     }
@@ -1855,27 +3103,42 @@ def run_wolof_pipeline(
         output_dir=output_dir,
         gpu_profile=gpu_profile,
         model_name=model_name,
+        method_a_text_corpus_file=method_a_text_corpus_file,
+        method_a_text_count=len(method_a_reference_texts),
         benchmark_results=benchmark_results,
         winner=winner,
         final_result=final_result,
         benchmark_splits=benchmark_splits,
         final_splits=full_splits,
+        english_replay_metadata=english_replay_metadata,
+        math_replay_metadata=math_replay_metadata,
+        train_mix_metadata=train_mix_metadata,
+        final_train_record_count=len(final_train_records),
     )
     report_path = output_dir / "wolof_finetuning_report.md"
     _write_text(report_path, markdown_report)
 
     summary = {
         "dataset_file": str(dataset_file),
+        "method_a_text_corpus_file": str(method_a_text_corpus_file),
+        "method_a_text_count": len(method_a_reference_texts),
         "output_dir": str(output_dir),
         "model_name": model_name,
         "gpu_profile": asdict(gpu_profile),
+        "benchmark_methods": benchmark_methods,
         "benchmark_results": benchmark_results,
         "winner": winner["method"],
+        "english_replay": english_replay_metadata,
+        "math_replay": math_replay_metadata,
+        "train_mix": train_mix_metadata,
         "final_result": {
             "eval_loss": final_result["eval_loss"],
             "perplexity": final_result["perplexity"],
             "report_path": str(report_path),
             "model_dir": str(final_dir / "model"),
+            "epoch_checkpoints_file": str(final_dir / "epoch_checkpoints.json"),
+            "epoch_checkpoint_count": final_train_summary["epoch_checkpoints"]["checkpoint_count"],
+            "train_record_count": len(final_train_records),
         },
     }
     _write_json_payload(output_dir / "run_summary.json", summary)

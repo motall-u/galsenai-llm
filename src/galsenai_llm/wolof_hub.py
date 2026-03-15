@@ -81,6 +81,7 @@ def _build_model_card(
     ]
     if include_benchmark:
         included_sections.append("- `benchmark/` tokenizer benchmark results")
+        included_sections.append("- `afrobench/` downstream Wolof benchmark results when available")
     if include_report:
         included_sections.append("- `artifacts/wolof_finetuning_report.md`")
     if include_sample_generations:
@@ -193,8 +194,13 @@ def build_wolof_hub_bundle(
     for source_path, relative_destination in (
         (final_result_path, Path("artifacts/final_result.json")),
         (run_summary_path, Path("artifacts/run_summary.json")),
+        (run_dir / "english_replay_dataset.json", Path("artifacts/english_replay_dataset.json")),
+        (run_dir / "math_replay_dataset.json", Path("artifacts/math_replay_dataset.json")),
+        (run_dir / "train_mix.json", Path("artifacts/train_mix.json")),
     ):
         destination = target_dir / relative_destination
+        if not source_path.exists():
+            continue
         _copy_path(source_path, destination)
         included_paths.append(_relative_path(destination, target_dir))
 
@@ -214,6 +220,15 @@ def build_wolof_hub_bundle(
             ]
             for source_path in benchmark_files:
                 if not source_path.exists():
+                    continue
+                destination = target_dir / _relative_path(source_path, run_dir)
+                _copy_path(source_path, destination)
+                included_paths.append(_relative_path(destination, target_dir))
+
+        afrobench_dir = run_dir / "afrobench"
+        if afrobench_dir.exists():
+            for source_path in sorted(afrobench_dir.rglob("*")):
+                if source_path.is_dir():
                     continue
                 destination = target_dir / _relative_path(source_path, run_dir)
                 _copy_path(source_path, destination)
