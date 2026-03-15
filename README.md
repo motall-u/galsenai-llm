@@ -7,7 +7,7 @@ The original notebook export is still in the repo as source material. The new pr
 ## Quickstart
 
 ```bash
-uv sync --extra train --extra unsloth --extra dev
+uv sync --extra train --extra dev
 uv run galsenai data validate data/samples/finetune_sample.jsonl
 uv run galsenai train --config configs/train/sample_qwen_tool_calling.yaml
 uv run galsenai merge --config configs/merge/sample_merge.yaml
@@ -15,6 +15,237 @@ uv run galsenai benchmark run --config configs/benchmark/sample_benchmark.yaml
 uv run galsenai wolof infer --prompt "Nanga def?"
 uv run galsenai wolof run --dataset-file data/wolof-dataset/curated_dataset.json --method-a-text-corpus-file <path-to-text-only-wolof-corpus>
 uv run galsenai wolof benchmark --run-dir outputs/wolof/<run-id> --prompt-variants 1 --limit 2
+```
+
+Use the built-in help when you need the full list of flags:
+
+```bash
+uv run galsenai --help
+uv run galsenai wolof --help
+uv run galsenai wolof run --help
+```
+
+## CLI Reference
+
+### General commands
+
+| Command | Purpose | Typical use |
+| --- | --- | --- |
+| `uv run galsenai data validate <file>` | Validate a training dataset in the project schema. | Check a JSONL file before training. |
+| `uv run galsenai train --config <yaml>` | Run the generic finetuning pipeline from a YAML config. | Tool-calling or non-Wolof SFT runs. |
+| `uv run galsenai merge --config <yaml>` | Merge an adapter into a base model. | Export a merged Transformers model after LoRA training. |
+| `uv run galsenai evaluate --config <yaml>` | Score predictions against benchmark expectations. | Offline evaluation from saved predictions. |
+| `uv run galsenai infer --config <yaml> [--prompt "..."]` | Run one-shot inference from a YAML inference config. | Test a generic model outside the Wolof pipeline. |
+| `uv run galsenai benchmark run --config <yaml>` | Run the generic benchmark pipeline from config. | Compare a model against the sample benchmark suite. |
+
+Examples:
+
+```bash
+uv run galsenai data validate data/samples/finetune_sample.jsonl
+uv run galsenai train --config configs/train/sample_qwen_tool_calling.yaml
+uv run galsenai merge --config configs/merge/sample_merge.yaml
+uv run galsenai evaluate --config configs/eval/sample_eval.yaml
+uv run galsenai infer --config configs/infer/wolof_base_qwen.yaml --prompt "Nanga def?"
+uv run galsenai benchmark run --config configs/benchmark/sample_benchmark.yaml
+```
+
+### Wolof commands
+
+| Command | Purpose | Typical use |
+| --- | --- | --- |
+| `uv run galsenai wolof infer ...` | One-shot inference with a local model, local adapter, or Hugging Face repo. | Quick prompt test before or after training. |
+| `uv run galsenai wolof chat ...` | Interactive multi-turn chat session. | Manual qualitative testing. |
+| `uv run galsenai wolof run ...` | Full Wolof tokenizer benchmark + fine-tuning pipeline. | Main end-to-end training entrypoint. |
+| `uv run galsenai wolof benchmark ...` | AfroBench evaluation for a Wolof run, local model, or HF repo. | Downstream benchmarking after training. |
+| `uv run galsenai wolof upload ...` | Upload a trained run or an epoch checkpoint to Hugging Face. | Publish the best model. |
+| `uv run galsenai wolof download ...` | Download a Wolof model repo from Hugging Face. | Restore a published checkpoint locally. |
+
+### `galsenai wolof infer`
+
+Use this for single-prompt inference. It accepts:
+- a local model directory
+- a Hugging Face full-model repo
+- a PEFT adapter repo
+- a local adapter via `--adapter-path`
+
+Common flags:
+- `--model-path`: local path or HF repo id
+- `--prompt`: prompt text
+- `--system-prompt`: override the default multilingual assistant prompt
+- `--max-new-tokens`
+- `--do-sample`, `--temperature`, `--top-p`
+
+Examples:
+
+```bash
+uv run galsenai wolof infer --prompt "Nanga def?"
+uv run galsenai wolof infer --model-path your-username/your-wolof-model --prompt "Who is Sadio Mane?"
+uv run galsenai wolof infer \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --adapter-path outputs/wolof/<run-id>/final/model \
+  --prompt "Tekkil ci Wolof: Hello my friend."
+```
+
+### `galsenai wolof chat`
+
+Interactive chat mode for the same model sources as `wolof infer`.
+
+Useful flags:
+- `--model-path`
+- `--adapter-path`
+- `--system-prompt`
+- `--max-new-tokens`
+- `--max-turns`
+
+Examples:
+
+```bash
+uv run galsenai wolof chat --model-path your-username/your-wolof-model
+uv run galsenai wolof chat \
+  --model-path Qwen/Qwen2.5-0.5B-Instruct \
+  --adapter-path outputs/wolof/<run-id>/final/model
+```
+
+### `galsenai wolof run`
+
+This is the main Wolof command. It always does two stages:
+- tokenizer benchmark on sampled Wolof conversations
+- final fine-tuning with the winning tokenizer method
+
+Key flags:
+- `--dataset-file`: Wolof conversation dataset
+- `--method-a-text-corpus-file`: separate text-only corpus used only by Method A
+- `--model-name`: change the base model without editing code
+- `--benchmark-samples`, `--full-samples`
+- `--benchmark-epochs`, `--full-epochs`
+- `--token-budget`
+- `--english-replay-dataset`, `--math-replay-dataset`
+- `--wolof-mix-ratio`, `--english-mix-ratio`, `--math-mix-ratio`
+- `--include-method-c`
+- `--output-dir`
+
+Examples:
+
+```bash
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset.json \
+  --method-a-text-corpus-file data/wolof-dataset/collections/curated_text.txt
+
+uv run galsenai wolof run \
+  --model-name Qwen/Qwen2.5-3B-Instruct \
+  --dataset-file data/wolof-dataset/curated_dataset_extended.json \
+  --method-a-text-corpus-file data/wolof-dataset/collections/curated_text.txt \
+  --benchmark-samples 1000 \
+  --full-samples 133799 \
+  --benchmark-epochs 3 \
+  --full-epochs 3 \
+  --output-dir outputs/wolof-qwen3b
+
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset_extended.json \
+  --method-a-text-corpus-file data/wolof-dataset/collections/curated_text.txt \
+  --english-replay-dataset HuggingFaceH4/ultrachat_200k \
+  --english-replay-split train_sft \
+  --math-replay-dataset nvidia/OpenMathReasoning \
+  --math-replay-split cot \
+  --wolof-mix-ratio 0.7 \
+  --english-mix-ratio 0.2 \
+  --math-mix-ratio 0.1 \
+  --benchmark-samples 1000 \
+  --full-samples 133799 \
+  --benchmark-epochs 3 \
+  --full-epochs 3 \
+  --output-dir outputs/wolof-h100-96gb
+```
+
+Method A specifics:
+- uses the separate text-only corpus to compute word frequency
+- trains a reference Wolof BPE to estimate the fragmentation threshold
+- adds selected Wolof tokens with **space-prefixed surfaces**
+- initializes new embeddings by averaging source subtoken embeddings
+- runs a round-trip tokenizer audit and writes it into `benchmark/method_a/token_selection.json`
+
+### `galsenai wolof benchmark`
+
+This command runs the Wolof AfroBench suite through the TRC `lm-evaluation-harness`
+fork. It supports:
+- `--run-dir` for a training run folder
+- `--model-path` for a local model or HF repo
+- `--all-epochs` to benchmark every saved epoch checkpoint
+
+Key flags:
+- `--tasks`
+- `--prompt-variants`
+- `--limit`
+- `--batch-size`
+- `--all-epochs`
+- `--log-samples`
+- `--write-out`
+
+Examples:
+
+```bash
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof/<run-id> \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1 \
+  --limit 2
+
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof/<run-id> \
+  --all-epochs \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1,2,3,4,5 \
+  --log-samples \
+  --write-out
+
+uv run galsenai wolof benchmark \
+  --model-path your-username/your-wolof-model \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1
+```
+
+### `galsenai wolof upload`
+
+Uploads a completed Wolof run to Hugging Face. By default it uploads `final/model`.
+You can also upload a specific saved epoch checkpoint.
+
+Key flags:
+- `--run-dir`
+- `--repo-id`
+- `--checkpoint-name`
+- `--checkpoint-epoch`
+- `--private`
+- `--include-benchmark`
+- `--include-report`
+- `--include-sample-generations`
+
+Examples:
+
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof/<run-id> \
+  --repo-id your-username/your-wolof-model
+
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof/<run-id> \
+  --checkpoint-name checkpoint-2389 \
+  --repo-id your-username/your-wolof-model \
+  --include-benchmark \
+  --include-report \
+  --include-sample-generations
+```
+
+### `galsenai wolof download`
+
+Download a published Wolof repo locally.
+
+Example:
+
+```bash
+uv run galsenai wolof download \
+  --repo-id your-username/your-wolof-model \
+  --local-dir models/your-wolof-model
 ```
 
 ## Wolof End-to-End Run
@@ -27,31 +258,6 @@ uv sync --extra train --extra dev
 uv run galsenai wolof run \
   --dataset-file data/wolof-dataset/curated_dataset.json \
   --method-a-text-corpus-file <path-to-text-only-wolof-corpus>
-```
-
-After a run completes, publish it with:
-
-```bash
-uv run galsenai wolof upload --run-dir outputs/wolof/<run-id> --repo-id your-username/your-wolof-model
-```
-
-Run the Wolof downstream AfroBench smoke benchmark with:
-
-```bash
-uv run galsenai wolof benchmark \
-  --run-dir outputs/wolof/<run-id> \
-  --tasks afrimmlu,afrixnli,belebele \
-  --prompt-variants 1 \
-  --limit 2
-```
-
-Or benchmark a model directly from Hugging Face:
-
-```bash
-uv run galsenai wolof benchmark \
-  --model-path your-username/your-wolof-model \
-  --tasks afrimmlu,afrixnli,belebele \
-  --prompt-variants 1
 ```
 
 The command always runs both stages:
@@ -114,11 +320,64 @@ The file `outputs/wolof/<run-id>/method_a_text_corpus.json` records which
 external text corpus was used to compute these frequencies and the reference
 fragmentation threshold.
 
+### Test Method A Tokenizer
+
+Use the helper script below to inspect one sentence with a saved Method A
+tokenizer. It prints raw tokens, reconstructed surface tokens, the decoded
+sentence, and whether the round-trip is exact.
+
+```bash
+uv run python scripts/test_method_a_tokenizer.py \
+  --run-dir outputs/wolof/<run-id> \
+  --text "Mënu nga ko gëna jëfandikoo?"
+```
+
+Or target a tokenizer directory directly:
+
+```bash
+uv run python scripts/test_method_a_tokenizer.py \
+  --tokenizer-path outputs/wolof/<run-id>/benchmark/method_a/tokenizer \
+  --text "Jéemal Charisse. Dafa baax lool."
+```
+
 On an H100-class GPU the pipeline now auto-switches to:
 
 - BF16 full fine-tuning.
 - Packed sequences for the benchmark and final run.
 - Much larger per-device batch sizes tuned for the short Wolof conversations in this dataset.
+
+### 96 GB H100 Run
+
+On a 96 GB H100, the current auto-profile resolves to:
+
+- benchmark train batch size: `32`
+- benchmark eval batch size: `16`
+- full train batch size: `32`
+- full eval batch size: `16`
+- packing: `True`
+
+Use this full run command:
+
+```bash
+uv run galsenai wolof run \
+  --dataset-file data/wolof-dataset/curated_dataset_extended.json \
+  --method-a-text-corpus-file data/wolof-dataset/collections/curated_text.txt \
+  --english-replay-dataset HuggingFaceH4/ultrachat_200k \
+  --english-replay-split train_sft \
+  --math-replay-dataset nvidia/OpenMathReasoning \
+  --math-replay-split cot \
+  --wolof-mix-ratio 0.7 \
+  --english-mix-ratio 0.2 \
+  --math-mix-ratio 0.1 \
+  --benchmark-samples 1000 \
+  --full-samples 133799 \
+  --benchmark-epochs 3 \
+  --full-epochs 3 \
+  --output-dir outputs/wolof-h100-96gb
+```
+
+No extra CLI flags are required for batch size or packing here. The pipeline
+detects the H100 with `nvidia-smi` and applies this profile automatically.
 
 ## Project layout
 

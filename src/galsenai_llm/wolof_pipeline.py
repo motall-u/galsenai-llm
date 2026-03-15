@@ -1479,6 +1479,77 @@ def _weighted_fragment_mean(
     return total_fragments / total_frequency
 
 
+def _exact_surface_piece_ids(
+    tokenizer: PreTrainedTokenizerBase,
+    surface: str,
+) -> list[int]:
+    token_ids = tokenizer.encode(surface, add_special_tokens=False)
+    return _strip_whitespace_only_ids(tokenizer, token_ids)
+
+
+def _method_a_added_surface(word: str) -> str:
+    normalized = word.strip()
+    return f" {normalized}" if normalized else normalized
+
+
+def _audit_method_a_round_trip(
+    tokenizer: PreTrainedTokenizerBase,
+    words: Sequence[str],
+) -> dict[str, Any]:
+    context_failure_count = 0
+    bare_failure_count = 0
+    context_failures: list[dict[str, str]] = []
+    bare_failures: list[dict[str, str]] = []
+
+    for word in words:
+        context_text = f"foo {word} bar"
+        context_decoded = tokenizer.decode(
+            tokenizer(context_text, add_special_tokens=False)["input_ids"],
+            skip_special_tokens=False,
+        )
+        if context_decoded != context_text:
+            context_failure_count += 1
+            if len(context_failures) < 10:
+                context_failures.append(
+                    {
+                        "word": word,
+                        "expected": context_text,
+                        "decoded": context_decoded,
+                    }
+                )
+
+        bare_text = f"{word} bar"
+        bare_decoded = tokenizer.decode(
+            tokenizer(bare_text, add_special_tokens=False)["input_ids"],
+            skip_special_tokens=False,
+        )
+        if bare_decoded != bare_text:
+            bare_failure_count += 1
+            if len(bare_failures) < 10:
+                bare_failures.append(
+                    {
+                        "word": word,
+                        "expected": bare_text,
+                        "decoded": bare_decoded,
+                    }
+                )
+
+    total_words = len(words)
+    return {
+        "checked_words": total_words,
+        "context_round_trip_failures": context_failure_count,
+        "bare_round_trip_failures": bare_failure_count,
+        "context_round_trip_failure_rate": (
+            float(context_failure_count) / float(total_words) if total_words else 0.0
+        ),
+        "bare_round_trip_failure_rate": (
+            float(bare_failure_count) / float(total_words) if total_words else 0.0
+        ),
+        "context_examples": context_failures,
+        "bare_examples": bare_failures,
+    }
+
+
 def build_method_a_adaptation(
     model_name: str,
     *,
@@ -1545,11 +1616,12 @@ def build_method_a_adaptation(
 
     added_tokens = []
     for candidate in selected:
+        candidate["added_token_surface"] = _method_a_added_surface(candidate["token"])
         added_tokens.append(
             AddedToken(
-                candidate["token"],
-                single_word=True,
-                lstrip=True,
+                candidate["added_token_surface"],
+                single_word=False,
+                lstrip=False,
                 normalized=False,
             )
         )
@@ -1564,14 +1636,18 @@ def build_method_a_adaptation(
     selected_metadata = []
     for candidate in selected:
         token = candidate["token"]
-        token_id = int(tokenizer.convert_tokens_to_ids(token))
-        source_ids = list(candidate["source_ids"])
+        added_token_surface = str(candidate["added_token_surface"])
+        token_id = int(tokenizer.get_vocab()[added_token_surface])
+        source_ids = _exact_surface_piece_ids(base_tokenizer, added_token_surface)
+        if not source_ids:
+            source_ids = list(candidate["source_ids"])
         embedding_sources[token_id] = source_ids
         embedding_source_weights[token_id] = _uniform_weights(len(source_ids))
         metric_token_ids.append(token_id)
         selected_metadata.append(
             {
                 "token": token,
+                "added_token_surface": added_token_surface,
                 "token_id": token_id,
                 "token_type": candidate["token_type"],
                 "frequency": candidate["frequency"],
@@ -1584,15 +1660,22 @@ def build_method_a_adaptation(
             }
         )
 
+    round_trip_audit = _audit_method_a_round_trip(
+        tokenizer,
+        [str(candidate["token"]) for candidate in selected],
+    )
+
     metadata = {
         "method": "method_a",
         "token_budget": token_budget,
         "embedding_init_method": "uniform_average",
+        "token_surface_policy": "space_prefixed_only",
         "reference_bpe_vocab_size": reference_bpe_vocab_size,
         "fragmentation_threshold": reference_fragment_threshold,
         "base_fragment_mean": base_fragment_mean,
         "selected_token_count": len(selected_metadata),
         "selected_tokens": selected_metadata,
+        "round_trip_audit": round_trip_audit,
         "candidate_summary": {
             "word_candidates": len(word_candidates),
             "min_frequency": 2,

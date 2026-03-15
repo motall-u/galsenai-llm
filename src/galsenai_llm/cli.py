@@ -25,6 +25,13 @@ app.add_typer(data_app, name="data")
 app.add_typer(benchmark_app, name="benchmark")
 app.add_typer(wolof_app, name="wolof")
 
+DEFAULT_WOLOF_SYSTEM_PROMPT = (
+    "You are a friendly, helpful multilingual assistant. "
+    "Respond in the language requested by the user, or match the user's language "
+    "when not specified. Follow the user's instructions closely and answer clearly "
+    "and directly."
+)
+
 
 def _print_report(report: dict) -> None:
     console.print_json(data=report)
@@ -111,10 +118,7 @@ def wolof_infer(
     adapter_path: Path | None = typer.Option(None, "--adapter-path"),
     base_model_name: str | None = typer.Option(None, "--base-model-name"),
     system_prompt: str | None = typer.Option(
-        (
-            "You are a helpful assistant for Wolof language tasks. "
-            "Reply in Wolof unless the user asks otherwise."
-        ),
+        DEFAULT_WOLOF_SYSTEM_PROMPT,
         "--system-prompt",
     ),
     device_map: str = typer.Option("auto", "--device-map"),
@@ -153,10 +157,7 @@ def wolof_chat(
     adapter_path: Path | None = typer.Option(None, "--adapter-path"),
     base_model_name: str | None = typer.Option(None, "--base-model-name"),
     system_prompt: str | None = typer.Option(
-        (
-            "You are a helpful assistant for Wolof language tasks. "
-            "Reply in Wolof unless the user asks otherwise."
-        ),
+        DEFAULT_WOLOF_SYSTEM_PROMPT,
         "--system-prompt",
     ),
     device_map: str = typer.Option("auto", "--device-map"),
@@ -493,6 +494,22 @@ def wolof_benchmark(
 def wolof_upload(
     run_dir: Path = typer.Option(..., "--run-dir", exists=True, file_okay=False, readable=True),
     repo_id: str = typer.Option(..., "--repo-id"),
+    checkpoint_name: str | None = typer.Option(
+        None,
+        "--checkpoint-name",
+        help=(
+            "Optional checkpoint directory name under final/model/, such as "
+            "checkpoint-2389. When omitted, the upload uses final/model."
+        ),
+    ),
+    checkpoint_epoch: int | None = typer.Option(
+        None,
+        "--checkpoint-epoch",
+        help=(
+            "Optional final fine-tuning epoch number to upload instead of the "
+            "default final/model directory."
+        ),
+    ),
     token: str | None = typer.Option(None, "--token"),
     private: bool = typer.Option(False, "--private/--public"),
     commit_message: str | None = typer.Option(None, "--commit-message"),
@@ -509,6 +526,8 @@ def wolof_upload(
         upload_wolof_run_to_hub(
             run_dir=run_dir,
             repo_id=repo_id,
+            checkpoint_name=checkpoint_name,
+            checkpoint_epoch=checkpoint_epoch,
             token=token,
             private=private,
             commit_message=commit_message,

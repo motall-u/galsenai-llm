@@ -56,6 +56,7 @@ def _build_model_card(
     repo_id: str,
     run_summary: dict[str, Any],
     model_kind: str,
+    uploaded_model_source: str,
     include_benchmark: bool,
     include_report: bool,
     include_sample_generations: bool,
@@ -108,6 +109,7 @@ This repository contains a Wolof fine-tune of `{base_model_name}` produced with 
 
 - Base model: `{base_model_name}`
 - Final model type: `{model_kind}`
+- Uploaded model source: `{uploaded_model_source}`
 - Training strategy: `{training_strategy}`
 - Winning tokenizer method: `{winner}`
 - Final validation loss: `{final_eval_loss_text}`
@@ -153,17 +155,62 @@ uv run galsenai wolof infer --model-path models/{repo_slug} --prompt "Nanga def?
 """
 
 
+def _load_epoch_checkpoint_index(run_dir: Path) -> list[dict[str, Any]]:
+    epoch_index_path = run_dir / "final" / "epoch_checkpoints.json"
+    if not epoch_index_path.exists():
+        return []
+    payload = _load_json(epoch_index_path)
+    checkpoints = payload.get("checkpoints", [])
+    if not isinstance(checkpoints, list):
+        return []
+    return [item for item in checkpoints if isinstance(item, dict)]
+
+
+def _resolve_upload_model_dir(
+    *,
+    run_dir: Path,
+    checkpoint_name: str | None,
+    checkpoint_epoch: int | None,
+) -> tuple[Path, str]:
+    if checkpoint_name and checkpoint_epoch is not None:
+        raise ValueError("Pass only one of checkpoint_name or checkpoint_epoch.")
+
+    default_model_dir = run_dir / "final" / "model"
+    if checkpoint_name is None and checkpoint_epoch is None:
+        return default_model_dir, "final/model"
+
+    if checkpoint_name is not None:
+        candidate = default_model_dir / checkpoint_name
+        if not candidate.exists():
+            raise ValueError(f"Could not find checkpoint directory at {candidate}.")
+        return candidate, checkpoint_name
+
+    checkpoints = _load_epoch_checkpoint_index(run_dir)
+    for checkpoint in checkpoints:
+        if int(checkpoint.get("epoch", -1)) != int(checkpoint_epoch):
+            continue
+        checkpoint_dir = Path(str(checkpoint["checkpoint_dir"]))
+        if checkpoint_dir.exists():
+            return checkpoint_dir, checkpoint_dir.name
+    raise ValueError(
+        f"Could not resolve checkpoint for epoch {checkpoint_epoch} under "
+        f"{run_dir / 'final' / 'epoch_checkpoints.json'}."
+    )
+
+
 def build_wolof_hub_bundle(
     *,
     run_dir: Path,
     target_dir: Path,
     repo_id: str,
+    source_model_dir: Path | None = None,
+    uploaded_model_source: str | None = None,
     include_benchmark: bool = True,
     include_report: bool = False,
     include_sample_generations: bool = False,
 ) -> dict[str, Any]:
     run_dir = run_dir.resolve()
-    model_dir = run_dir / "final" / "model"
+    model_dir = (source_model_dir or (run_dir / "final" / "model")).resolve()
     run_summary_path = run_dir / "run_summary.json"
     final_result_path = run_dir / "final" / "final_result.json"
 
@@ -177,12 +224,22 @@ def build_wolof_hub_bundle(
     run_summary = _load_json(run_summary_path)
     model_kind = _detect_model_kind(model_dir)
     base_model_name = _resolve_base_model_name(run_summary, model_dir)
+    model_source_label = uploaded_model_source or _relative_path(model_dir, run_dir)
 
     target_dir.mkdir(parents=True, exist_ok=True)
     included_paths: list[str] = []
 
+    skipped_model_files = {
+        "README.md",
+        "trainer_state.json",
+        "training_args.bin",
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+        "epoch_summary.json",
+    }
     for source_path in sorted(model_dir.iterdir()):
-        if source_path.name in {"README.md", "trainer_state.json", "training_args.bin"}:
+        if source_path.name in skipped_model_files:
             continue
         if source_path.name.startswith("checkpoint-"):
             continue
@@ -255,10 +312,12 @@ def build_wolof_hub_bundle(
         "training_strategy": run_summary.get("gpu_profile", {}).get("training_strategy"),
         "winner": run_summary.get("winner"),
         "final_perplexity": run_summary.get("final_result", {}).get("perplexity"),
+        "uploaded_model_source": model_source_label,
         "included_benchmark": include_benchmark,
         "included_report": include_report,
         "included_sample_generations": include_sample_generations,
         "source_run_dir": str(run_dir),
+        "source_model_dir": str(model_dir),
         "included_paths": included_paths,
     }
     write_json(target_dir / "galsenai_wolof_metadata.json", metadata)
@@ -267,6 +326,7 @@ def build_wolof_hub_bundle(
         repo_id=repo_id,
         run_summary=run_summary,
         model_kind=model_kind,
+        uploaded_model_source=model_source_label,
         include_benchmark=include_benchmark,
         include_report=include_report,
         include_sample_generations=include_sample_generations,
@@ -285,6 +345,8 @@ def upload_wolof_run_to_hub(
     *,
     run_dir: Path,
     repo_id: str,
+    checkpoint_name: str | None = None,
+    checkpoint_epoch: int | None = None,
     token: str | None = None,
     private: bool = False,
     commit_message: str | None = None,
@@ -292,6 +354,12 @@ def upload_wolof_run_to_hub(
     include_report: bool = False,
     include_sample_generations: bool = False,
 ) -> dict[str, Any]:
+    resolved_run_dir = run_dir.resolve()
+    source_model_dir, uploaded_model_source = _resolve_upload_model_dir(
+        run_dir=resolved_run_dir,
+        checkpoint_name=checkpoint_name,
+        checkpoint_epoch=checkpoint_epoch,
+    )
     resolved_token = _resolve_hf_token(token)
     api = HfApi(token=resolved_token)
     api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
@@ -299,9 +367,11 @@ def upload_wolof_run_to_hub(
     with tempfile.TemporaryDirectory(prefix="galsenai-hf-upload-") as temporary_directory:
         staging_dir = Path(temporary_directory) / "bundle"
         metadata = build_wolof_hub_bundle(
-            run_dir=run_dir,
+            run_dir=resolved_run_dir,
             target_dir=staging_dir,
             repo_id=repo_id,
+            source_model_dir=source_model_dir,
+            uploaded_model_source=uploaded_model_source,
             include_benchmark=include_benchmark,
             include_report=include_report,
             include_sample_generations=include_sample_generations,
@@ -310,7 +380,8 @@ def upload_wolof_run_to_hub(
             repo_id=repo_id,
             repo_type="model",
             folder_path=str(staging_dir),
-            commit_message=commit_message or "Upload Wolof fine-tuning artifacts",
+            commit_message=commit_message
+            or f"Upload Wolof fine-tuning artifacts ({uploaded_model_source})",
             token=resolved_token,
         )
 
@@ -319,7 +390,9 @@ def upload_wolof_run_to_hub(
         "repo_type": "model",
         "private": private,
         "repo_url": f"https://huggingface.co/{repo_id}",
-        "run_dir": str(run_dir.resolve()),
+        "run_dir": str(resolved_run_dir),
+        "uploaded_model_source": uploaded_model_source,
+        "source_model_dir": str(source_model_dir),
         "model_kind": metadata["model_kind"],
         "base_model_name": metadata["base_model_name"],
         "included_benchmark": include_benchmark,

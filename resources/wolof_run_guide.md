@@ -532,6 +532,25 @@ uv run galsenai wolof upload \
   --repo-id your-username/your-wolof-model
 ```
 
+If AfroBench says an earlier epoch checkpoint is better than the default final
+model, upload that checkpoint instead:
+
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof-full-all/<run-id> \
+  --checkpoint-name checkpoint-2389 \
+  --repo-id your-username/your-wolof-model
+```
+
+You can also select by epoch number when `final/epoch_checkpoints.json` exists:
+
+```bash
+uv run galsenai wolof upload \
+  --run-dir outputs/wolof-full-all/<run-id> \
+  --checkpoint-epoch 1 \
+  --repo-id your-username/your-wolof-model
+```
+
 Useful optional flags:
 
 - `--private` to create a private model repo

@@ -2,7 +2,7 @@ model_path: Qwen/Qwen2.5-0.5B-Instruct
 device_map: auto
 dtype: bfloat16
 prompt: Naka nga def?
-system_prompt: You are a helpful assistant for Wolof language tasks. Reply in Wolof unless the user asks otherwise.
+system_prompt: You are a friendly, helpful multilingual assistant. Respond in the language requested by the user, or match the user's language when not specified. Follow the user's instructions closely and answer clearly and directly.
 tool_registry: none
 tools: []
 generation:
