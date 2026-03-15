@@ -439,7 +439,11 @@ def wolof_benchmark(
     prompt_variants: str = typer.Option(
         "1,2,3,4,5",
         "--prompt-variants",
-        help="Comma-separated AfroBench prompt template variants. Use `1` for a smoke run.",
+        help=(
+            "Comma-separated AfroBench prompt template variants. Use `1` for a smoke run. "
+            "Broken Wolof variants are skipped automatically, for example AfriMMLU "
+            "prompt_4 and prompt_5 in the current AfroBench release."
+        ),
     ),
     output_dir: Path | None = typer.Option(
         None,

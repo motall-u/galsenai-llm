@@ -31,6 +31,19 @@ AFROBENCH_WOLOF_TASK_TEMPLATES: dict[str, str] = {
     "afrimmlu_math": "afrimmlu_math_wol",
 }
 
+BROKEN_WOLOF_PROMPT_VARIANTS: dict[str, dict[int, str]] = {
+    "afrimmlu": {
+        4: (
+            "The installed AfriBench Wolof AfriMMLU prompt_4 template leaves "
+            "literal {subject}/{question} placeholders unresolved."
+        ),
+        5: (
+            "The installed AfriBench Wolof AfriMMLU prompt_5 template leaves "
+            "the {subject} placeholder unresolved."
+        ),
+    }
+}
+
 DEFAULT_AFROBENCH_WOLOF_TASKS: tuple[str, ...] = (
     "afrimmlu",
     "afrixnli",
@@ -108,7 +121,21 @@ def _parse_prompt_variants(raw_value: str | None) -> list[int]:
 
 
 def _expand_afrobench_tasks(task_names: list[str], prompt_variants: list[int]) -> list[str]:
+    expanded_tasks, _, _ = _expand_afrobench_tasks_with_blacklist(
+        task_names=task_names,
+        prompt_variants=prompt_variants,
+    )
+    return expanded_tasks
+
+
+def _expand_afrobench_tasks_with_blacklist(
+    *,
+    task_names: list[str],
+    prompt_variants: list[int],
+) -> tuple[list[str], dict[str, list[int] | None], list[dict[str, Any]]]:
     expanded_tasks: list[str] = []
+    effective_prompt_variants: dict[str, list[int] | None] = {}
+    skipped_prompt_variants: list[dict[str, Any]] = []
     for task_name in task_names:
         template = AFROBENCH_WOLOF_TASK_TEMPLATES.get(task_name)
         if template is None:
@@ -117,13 +144,58 @@ def _expand_afrobench_tasks(task_names: list[str], prompt_variants: list[int]) -
                 f"Unsupported AfroBench task '{task_name}'. Valid values: {valid_names}"
             )
         if "{variant}" in template:
-            expanded_tasks.extend(
-                template.format(variant=variant)
-                for variant in prompt_variants
-            )
+            allowed_variants: list[int] = []
+            blacklisted_variants = BROKEN_WOLOF_PROMPT_VARIANTS.get(task_name, {})
+            for variant in prompt_variants:
+                reason = blacklisted_variants.get(variant)
+                if reason is not None:
+                    skipped_prompt_variants.append(
+                        {
+                            "task": task_name,
+                            "variant": variant,
+                            "reason": reason,
+                        }
+                    )
+                    continue
+                expanded_tasks.append(template.format(variant=variant))
+                allowed_variants.append(variant)
+            if not allowed_variants:
+                blacklisted_text = ", ".join(str(value) for value in sorted(blacklisted_variants))
+                requested_text = ", ".join(str(value) for value in prompt_variants)
+                raise ValueError(
+                    f"All requested prompt variants were filtered out for AfroBench task "
+                    f"'{task_name}'. Requested: {requested_text}. Blacklisted Wolof variants "
+                    f"for this task: {blacklisted_text or 'none'}."
+                )
+            effective_prompt_variants[task_name] = allowed_variants
         else:
             expanded_tasks.append(template)
-    return expanded_tasks
+            effective_prompt_variants[task_name] = None
+    return expanded_tasks, effective_prompt_variants, skipped_prompt_variants
+
+
+def _render_effective_prompt_variants(
+    effective_prompt_variants: dict[str, list[int] | None],
+) -> str:
+    rows = []
+    for task_name, variants in effective_prompt_variants.items():
+        if variants is None:
+            rows.append(f"- `{task_name}`: n/a")
+        else:
+            variant_text = ", ".join(str(variant) for variant in variants)
+            rows.append(f"- `{task_name}`: {variant_text}")
+    return "\n".join(rows) if rows else "- none"
+
+
+def _render_skipped_prompt_variants(skipped_prompt_variants: list[dict[str, Any]]) -> str:
+    if not skipped_prompt_variants:
+        return "- none"
+    rows = []
+    for item in skipped_prompt_variants:
+        rows.append(
+            f"- `{item['task']}` prompt_{item['variant']}: {item['reason']}"
+        )
+    return "\n".join(rows)
 
 
 def _pick_primary_metric(metrics: dict[str, Any]) -> tuple[str | None, float | None]:
@@ -517,7 +589,9 @@ def _render_report_markdown(
     *,
     model_spec: AfroBenchModelSpec,
     task_names: list[str],
-    prompt_variants: list[int],
+    requested_prompt_variants: list[int],
+    effective_prompt_variants: dict[str, list[int] | None],
+    skipped_prompt_variants: list[dict[str, Any]],
     batch_size: str,
     num_fewshot: int,
     limit: float | None,
@@ -556,10 +630,20 @@ def _render_report_markdown(
 - Pretrained model reference passed to `lm_eval`: `{model_spec.pretrained_model}`
 - Tokenizer path: `{model_spec.tokenizer_path or model_spec.pretrained_model}`
 - Adapter path: `{model_spec.adapter_path or 'none'}`
-- Prompt variants: `{", ".join(str(variant) for variant in prompt_variants)}`
+- Requested prompt variants: `{", ".join(str(variant) for variant in requested_prompt_variants)}`
 - Few-shot examples: `{num_fewshot}`
 - Batch size: `{batch_size}`
 - Limit per task: `{limit_text}`
+
+## Prompt Variant Resolution
+
+### Effective Variants
+
+{_render_effective_prompt_variants(effective_prompt_variants)}
+
+### Skipped Variants
+
+{_render_skipped_prompt_variants(skipped_prompt_variants)}
 
 ## Evaluated Tasks
 
@@ -587,7 +671,9 @@ def _render_epoch_report_markdown(
     *,
     run_dir: Path,
     tasks: list[str],
-    prompt_variants: list[int],
+    requested_prompt_variants: list[int],
+    effective_prompt_variants: dict[str, list[int] | None],
+    skipped_prompt_variants: list[dict[str, Any]],
     limit: float | None,
     batch_size: str,
     epoch_results: list[dict[str, Any]],
@@ -614,9 +700,19 @@ def _render_epoch_report_markdown(
 ## Run Setup
 
 - Run directory: `{run_dir}`
-- Prompt variants: `{", ".join(str(variant) for variant in prompt_variants)}`
+- Requested prompt variants: `{", ".join(str(variant) for variant in requested_prompt_variants)}`
 - Batch size: `{batch_size}`
 - Limit per task: `{limit_text}`
+
+## Prompt Variant Resolution
+
+### Effective Variants
+
+{_render_effective_prompt_variants(effective_prompt_variants)}
+
+### Skipped Variants
+
+{_render_skipped_prompt_variants(skipped_prompt_variants)}
 
 ## Evaluated Tasks
 
@@ -675,7 +771,14 @@ def run_wolof_afrobench_benchmark(
 
     selected_tasks = _parse_csv_items(tasks) or list(DEFAULT_AFROBENCH_WOLOF_TASKS)
     selected_prompt_variants = _parse_prompt_variants(prompt_variants)
-    expanded_tasks = _expand_afrobench_tasks(selected_tasks, selected_prompt_variants)
+    (
+        expanded_tasks,
+        effective_prompt_variants,
+        skipped_prompt_variants,
+    ) = _expand_afrobench_tasks_with_blacklist(
+        task_names=selected_tasks,
+        prompt_variants=selected_prompt_variants,
+    )
 
     model_spec = _resolve_model_spec(
         model_path=model_path,
@@ -772,6 +875,8 @@ def run_wolof_afrobench_benchmark(
         "tasks": selected_tasks,
         "expanded_tasks": expanded_tasks,
         "prompt_variants": selected_prompt_variants,
+        "effective_prompt_variants": effective_prompt_variants,
+        "skipped_prompt_variants": skipped_prompt_variants,
         "batch_size": batch_size,
         "max_batch_size": max_batch_size,
         "num_fewshot": num_fewshot,
@@ -800,7 +905,9 @@ def run_wolof_afrobench_benchmark(
     report_markdown = _render_report_markdown(
         model_spec=model_spec,
         task_names=expanded_tasks,
-        prompt_variants=selected_prompt_variants,
+        requested_prompt_variants=selected_prompt_variants,
+        effective_prompt_variants=effective_prompt_variants,
+        skipped_prompt_variants=skipped_prompt_variants,
         batch_size=batch_size,
         num_fewshot=num_fewshot,
         limit=limit,
@@ -822,6 +929,8 @@ def run_wolof_afrobench_benchmark(
         "tasks": selected_tasks,
         "expanded_tasks": expanded_tasks,
         "prompt_variants": selected_prompt_variants,
+        "effective_prompt_variants": effective_prompt_variants,
+        "skipped_prompt_variants": skipped_prompt_variants,
         "batch_size": batch_size,
         "num_fewshot": num_fewshot,
         "limit": limit,
@@ -873,6 +982,10 @@ def run_wolof_afrobench_epoch_benchmarks(
 
     selected_tasks = _parse_csv_items(tasks) or list(DEFAULT_AFROBENCH_WOLOF_TASKS)
     selected_prompt_variants = _parse_prompt_variants(prompt_variants)
+    _, effective_prompt_variants, skipped_prompt_variants = _expand_afrobench_tasks_with_blacklist(
+        task_names=selected_tasks,
+        prompt_variants=selected_prompt_variants,
+    )
     resolved_output_dir = (
         output_dir.resolve()
         if output_dir is not None
@@ -966,6 +1079,8 @@ def run_wolof_afrobench_epoch_benchmarks(
         "run_dir": str(resolved_run_dir),
         "tasks": selected_tasks,
         "prompt_variants": selected_prompt_variants,
+        "effective_prompt_variants": effective_prompt_variants,
+        "skipped_prompt_variants": skipped_prompt_variants,
         "batch_size": batch_size,
         "num_fewshot": num_fewshot,
         "limit": limit,
@@ -983,7 +1098,9 @@ def run_wolof_afrobench_epoch_benchmarks(
     report_markdown = _render_epoch_report_markdown(
         run_dir=resolved_run_dir,
         tasks=selected_tasks,
-        prompt_variants=selected_prompt_variants,
+        requested_prompt_variants=selected_prompt_variants,
+        effective_prompt_variants=effective_prompt_variants,
+        skipped_prompt_variants=skipped_prompt_variants,
         limit=limit,
         batch_size=batch_size,
         epoch_results=epoch_results,
@@ -996,6 +1113,9 @@ def run_wolof_afrobench_epoch_benchmarks(
     return {
         "run_dir": str(resolved_run_dir),
         "epoch_checkpoint_count": len(checkpoints),
+        "prompt_variants": selected_prompt_variants,
+        "effective_prompt_variants": effective_prompt_variants,
+        "skipped_prompt_variants": skipped_prompt_variants,
         "best_epoch": best_epoch,
         "best_epoch_selection": best_epoch_selection,
         "output_dir": str(resolved_output_dir),

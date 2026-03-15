@@ -245,6 +245,7 @@ uv run galsenai wolof benchmark \
 Notes:
 - Without `--merge`, a PEFT run is benchmarked as base model + adapter.
 - With `--merge --merge-dtype float16`, the adapter is first merged into a temporary FP16 model, and AfroBench runs on that merged model instead of the adapter path.
+- Broken Wolof prompt variants are skipped automatically. In the current AfroBench build, `afrimmlu` prompt variants `4` and `5` are blacklisted because the upstream templates leave placeholders like `{subject}` unresolved.
 
 ### `galsenai wolof upload`
 
