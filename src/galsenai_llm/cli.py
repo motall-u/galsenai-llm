@@ -465,7 +465,27 @@ def wolof_benchmark(
     ),
     batch_size: str = typer.Option("auto", "--batch-size"),
     max_batch_size: int | None = typer.Option(None, "--max-batch-size"),
-    num_fewshot: int = typer.Option(0, "--num-fewshot"),
+    num_fewshot: int = typer.Option(
+        0,
+        "--num-fewshot",
+        help="Legacy single-run few-shot count. Ignored when --fewshot-values is provided.",
+    ),
+    fewshot_values: str | None = typer.Option(
+        None,
+        "--fewshot-values",
+        help=(
+            "Comma-separated few-shot counts to evaluate. By default the benchmark runs "
+            "both 0-shot and 5-shot. Example: `0,5`."
+        ),
+    ),
+    system_prompt: str | None = typer.Option(
+        None,
+        "--system-prompt",
+        help=(
+            "Optional benchmark system prompt. When omitted, the Wolof benchmark uses "
+            "a strict instruction-following multilingual evaluation prompt."
+        ),
+    ),
     device: str | None = typer.Option("cuda", "--device"),
     dtype: str | None = typer.Option("auto", "--dtype"),
     load_in_4bit: bool = typer.Option(False, "--load-in-4bit/--no-load-in-4bit"),
@@ -473,7 +493,7 @@ def wolof_benchmark(
     use_fast_tokenizer: bool = typer.Option(True, "--use-fast-tokenizer/--no-fast-tokenizer"),
     add_bos_token: bool = typer.Option(False, "--add-bos-token/--no-add-bos-token"),
     apply_chat_template: bool = typer.Option(
-        False,
+        True,
         "--apply-chat-template/--no-chat-template",
     ),
     fewshot_as_multiturn: bool = typer.Option(
@@ -489,6 +509,12 @@ def wolof_benchmark(
         run_wolof_afrobench_epoch_benchmarks,
     )
 
+    resolved_fewshot_values = (
+        fewshot_values
+        if fewshot_values is not None
+        else ("0,5" if num_fewshot == 0 else str(num_fewshot))
+    )
+
     if all_epochs:
         if run_dir is None:
             raise typer.BadParameter("--all-epochs requires --run-dir.")
@@ -502,6 +528,8 @@ def wolof_benchmark(
                 batch_size=batch_size,
                 max_batch_size=max_batch_size,
                 num_fewshot=num_fewshot,
+                fewshot_values=resolved_fewshot_values,
+                system_instruction=system_prompt,
                 device=device,
                 dtype=dtype,
                 merge_adapter=merge,
@@ -533,6 +561,8 @@ def wolof_benchmark(
             batch_size=batch_size,
             max_batch_size=max_batch_size,
             num_fewshot=num_fewshot,
+            fewshot_values=resolved_fewshot_values,
+            system_instruction=system_prompt,
             device=device,
             dtype=dtype,
             merge_adapter=merge,

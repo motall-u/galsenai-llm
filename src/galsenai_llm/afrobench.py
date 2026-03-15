@@ -50,6 +50,15 @@ DEFAULT_AFROBENCH_WOLOF_TASKS: tuple[str, ...] = (
     "belebele",
 )
 
+DEFAULT_AFROBENCH_FEWSHOT_VALUES: tuple[int, ...] = (0, 5)
+
+DEFAULT_AFROBENCH_SYSTEM_PROMPT = (
+    "You are a careful, instruction-following multilingual evaluation assistant. "
+    "Read the task instructions exactly and follow the requested output format strictly. "
+    "For multiple-choice tasks, return only the answer in the requested format and do not "
+    "add explanations unless the prompt explicitly asks for one."
+)
+
 PRIMARY_METRIC_PRIORITY: tuple[str, ...] = (
     "acc_norm,none",
     "acc,none",
@@ -118,6 +127,21 @@ def _parse_prompt_variants(raw_value: str | None) -> list[int]:
     if invalid:
         raise ValueError(f"Prompt variants must be between 1 and 5. Invalid values: {invalid}")
     return variants
+
+
+def _parse_fewshot_values(raw_value: str | None) -> list[int]:
+    if raw_value is None:
+        return list(DEFAULT_AFROBENCH_FEWSHOT_VALUES)
+    values = []
+    for item in _parse_csv_items(raw_value):
+        value = int(item)
+        if value < 0:
+            raise ValueError("Few-shot values must be non-negative integers.")
+        if value not in values:
+            values.append(value)
+    if not values:
+        raise ValueError("At least one few-shot value is required.")
+    return values
 
 
 def _expand_afrobench_tasks(task_names: list[str], prompt_variants: list[int]) -> list[str]:
@@ -196,6 +220,81 @@ def _render_skipped_prompt_variants(skipped_prompt_variants: list[dict[str, Any]
             f"- `{item['task']}` prompt_{item['variant']}: {item['reason']}"
         )
     return "\n".join(rows)
+
+
+def _fewshot_output_dir(base_dir: Path, num_fewshot: int) -> Path:
+    return base_dir / f"{num_fewshot}-shot"
+
+
+def _render_fewshot_benchmark_report(
+    *,
+    fewshot_values: list[int],
+    results: list[dict[str, Any]],
+    summary_path: Path,
+) -> str:
+    rows = []
+    for item in results:
+        rows.append(
+            "| {num_fewshot} | `{summary}` | `{report}` |".format(
+                num_fewshot=item["num_fewshot"],
+                summary=item["summary_file"],
+                report=item["report_file"],
+            )
+        )
+    fewshot_text = ", ".join(str(value) for value in fewshot_values)
+    return f"""# Wolof AfroBench Few-Shot Sweep
+
+## Run Setup
+
+- Few-shot values: `{fewshot_text}`
+
+## Per-Run Results
+
+| Few-Shot | Summary | Report |
+| --- | --- | --- |
+{chr(10).join(rows) if rows else '| n/a | n/a | n/a |'}
+
+## Raw Summary
+
+- Aggregated JSON summary: `{summary_path}`
+"""
+
+
+def _render_fewshot_epoch_report(
+    *,
+    run_dir: Path,
+    fewshot_values: list[int],
+    results: list[dict[str, Any]],
+    summary_path: Path,
+) -> str:
+    rows = []
+    for item in results:
+        rows.append(
+            "| {num_fewshot} | {best_epoch} | `{summary}` | `{report}` |".format(
+                num_fewshot=item["num_fewshot"],
+                best_epoch=item.get("best_epoch", "n/a"),
+                summary=item["summary_file"],
+                report=item["report_file"],
+            )
+        )
+    fewshot_text = ", ".join(str(value) for value in fewshot_values)
+    return f"""# Wolof AfroBench Few-Shot Epoch Sweep
+
+## Run Setup
+
+- Run directory: `{run_dir}`
+- Few-shot values: `{fewshot_text}`
+
+## Per-Run Results
+
+| Few-Shot | Best Epoch | Summary | Report |
+| --- | --- | --- | --- |
+{chr(10).join(rows) if rows else '| n/a | n/a | n/a | n/a |'}
+
+## Raw Summary
+
+- Aggregated JSON summary: `{summary_path}`
+"""
 
 
 def _pick_primary_metric(metrics: dict[str, Any]) -> tuple[str | None, float | None]:
@@ -594,6 +693,7 @@ def _render_report_markdown(
     skipped_prompt_variants: list[dict[str, Any]],
     batch_size: str,
     num_fewshot: int,
+    system_instruction: str | None,
     limit: float | None,
     result_rows: list[dict[str, Any]],
     aggregate_rows: list[dict[str, Any]],
@@ -632,6 +732,7 @@ def _render_report_markdown(
 - Adapter path: `{model_spec.adapter_path or 'none'}`
 - Requested prompt variants: `{", ".join(str(variant) for variant in requested_prompt_variants)}`
 - Few-shot examples: `{num_fewshot}`
+- System instruction: `{system_instruction or 'none'}`
 - Batch size: `{batch_size}`
 - Limit per task: `{limit_text}`
 
@@ -676,6 +777,7 @@ def _render_epoch_report_markdown(
     skipped_prompt_variants: list[dict[str, Any]],
     limit: float | None,
     batch_size: str,
+    system_instruction: str | None,
     epoch_results: list[dict[str, Any]],
     summary_path: Path,
 ) -> str:
@@ -701,6 +803,7 @@ def _render_epoch_report_markdown(
 
 - Run directory: `{run_dir}`
 - Requested prompt variants: `{", ".join(str(variant) for variant in requested_prompt_variants)}`
+- System instruction: `{system_instruction or 'none'}`
 - Batch size: `{batch_size}`
 - Limit per task: `{limit_text}`
 
@@ -730,7 +833,7 @@ def _render_epoch_report_markdown(
 """
 
 
-def run_wolof_afrobench_benchmark(
+def _run_wolof_afrobench_single_benchmark(
     *,
     model_path: str | None = None,
     run_dir: Path | None = None,
@@ -744,6 +847,7 @@ def run_wolof_afrobench_benchmark(
     batch_size: str = "auto",
     max_batch_size: int | None = None,
     num_fewshot: int = 0,
+    system_instruction: str | None = None,
     device: str | None = "cuda",
     dtype: str | None = "auto",
     merge_adapter: bool = False,
@@ -853,6 +957,7 @@ def run_wolof_afrobench_benchmark(
             log_samples=log_samples,
             write_out=write_out,
             bootstrap_iters=bootstrap_iters,
+            system_instruction=system_instruction,
             apply_chat_template=apply_chat_template,
             fewshot_as_multiturn=fewshot_as_multiturn,
         )
@@ -880,6 +985,7 @@ def run_wolof_afrobench_benchmark(
         "batch_size": batch_size,
         "max_batch_size": max_batch_size,
         "num_fewshot": num_fewshot,
+        "system_instruction": system_instruction,
         "device": device,
         "dtype": effective_dtype,
         "requested_dtype": dtype,
@@ -910,6 +1016,7 @@ def run_wolof_afrobench_benchmark(
         skipped_prompt_variants=skipped_prompt_variants,
         batch_size=batch_size,
         num_fewshot=num_fewshot,
+        system_instruction=system_instruction,
         limit=limit,
         result_rows=result_rows,
         aggregate_rows=aggregate_rows,
@@ -933,6 +1040,7 @@ def run_wolof_afrobench_benchmark(
         "skipped_prompt_variants": skipped_prompt_variants,
         "batch_size": batch_size,
         "num_fewshot": num_fewshot,
+        "system_instruction": system_instruction,
         "limit": limit,
         "device": device,
         "dtype": effective_dtype,
@@ -949,7 +1057,7 @@ def run_wolof_afrobench_benchmark(
     }
 
 
-def run_wolof_afrobench_epoch_benchmarks(
+def _run_wolof_afrobench_single_epoch_benchmarks(
     *,
     run_dir: Path,
     tasks: str | None = None,
@@ -959,6 +1067,7 @@ def run_wolof_afrobench_epoch_benchmarks(
     batch_size: str = "auto",
     max_batch_size: int | None = None,
     num_fewshot: int = 0,
+    system_instruction: str | None = None,
     device: str | None = "cuda",
     dtype: str | None = "auto",
     merge_adapter: bool = False,
@@ -998,7 +1107,7 @@ def run_wolof_afrobench_epoch_benchmarks(
         epoch = int(checkpoint["epoch"])
         checkpoint_dir = Path(checkpoint["checkpoint_dir"]).resolve()
         checkpoint_output_dir = resolved_output_dir / f"epoch-{epoch}"
-        result = run_wolof_afrobench_benchmark(
+        result = _run_wolof_afrobench_single_benchmark(
             model_path=str(checkpoint_dir),
             run_dir=None,
             adapter_path=None,
@@ -1011,6 +1120,7 @@ def run_wolof_afrobench_epoch_benchmarks(
             batch_size=batch_size,
             max_batch_size=max_batch_size,
             num_fewshot=num_fewshot,
+            system_instruction=system_instruction,
             device=device,
             dtype=dtype,
             merge_adapter=merge_adapter,
@@ -1083,6 +1193,7 @@ def run_wolof_afrobench_epoch_benchmarks(
         "skipped_prompt_variants": skipped_prompt_variants,
         "batch_size": batch_size,
         "num_fewshot": num_fewshot,
+        "system_instruction": system_instruction,
         "limit": limit,
         "device": device,
         "dtype": dtype,
@@ -1103,6 +1214,7 @@ def run_wolof_afrobench_epoch_benchmarks(
         skipped_prompt_variants=skipped_prompt_variants,
         limit=limit,
         batch_size=batch_size,
+        system_instruction=system_instruction,
         epoch_results=epoch_results,
         summary_path=summary_path,
     )
@@ -1122,4 +1234,291 @@ def run_wolof_afrobench_epoch_benchmarks(
         "summary_file": str(summary_path),
         "report_file": str(report_path),
         "epoch_results": epoch_results,
+    }
+
+
+def run_wolof_afrobench_benchmark(
+    *,
+    model_path: str | None = None,
+    run_dir: Path | None = None,
+    adapter_path: Path | None = None,
+    tokenizer_path: Path | None = None,
+    base_model_name: str | None = None,
+    tasks: str | None = None,
+    prompt_variants: str | None = None,
+    output_dir: Path | None = None,
+    limit: float | None = None,
+    batch_size: str = "auto",
+    max_batch_size: int | None = None,
+    num_fewshot: int = 0,
+    fewshot_values: str | None = None,
+    system_instruction: str | None = DEFAULT_AFROBENCH_SYSTEM_PROMPT,
+    device: str | None = "cuda",
+    dtype: str | None = "auto",
+    merge_adapter: bool = False,
+    merge_dtype: str | None = None,
+    load_in_4bit: bool = False,
+    trust_remote_code: bool = False,
+    use_fast_tokenizer: bool = True,
+    add_bos_token: bool = False,
+    apply_chat_template: bool = True,
+    fewshot_as_multiturn: bool = False,
+    log_samples: bool = False,
+    write_out: bool = False,
+    bootstrap_iters: int = 0,
+) -> dict[str, Any]:
+    resolved_system_instruction = (
+        system_instruction
+        if system_instruction is not None
+        else DEFAULT_AFROBENCH_SYSTEM_PROMPT
+    )
+    resolved_fewshot_values = (
+        _parse_fewshot_values(fewshot_values)
+        if fewshot_values is not None
+        else (
+            list(DEFAULT_AFROBENCH_FEWSHOT_VALUES)
+            if num_fewshot == 0
+            else [num_fewshot]
+        )
+    )
+    if len(resolved_fewshot_values) == 1:
+        return _run_wolof_afrobench_single_benchmark(
+            model_path=model_path,
+            run_dir=run_dir,
+            adapter_path=adapter_path,
+            tokenizer_path=tokenizer_path,
+            base_model_name=base_model_name,
+            tasks=tasks,
+            prompt_variants=prompt_variants,
+            output_dir=output_dir,
+            limit=limit,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+            num_fewshot=resolved_fewshot_values[0],
+            system_instruction=resolved_system_instruction,
+            device=device,
+            dtype=dtype,
+            merge_adapter=merge_adapter,
+            merge_dtype=merge_dtype,
+            load_in_4bit=load_in_4bit,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+            add_bos_token=add_bos_token,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            log_samples=log_samples,
+            write_out=write_out,
+            bootstrap_iters=bootstrap_iters,
+        )
+
+    if output_dir is None:
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        if run_dir is not None:
+            resolved_output_dir = run_dir.resolve() / "afrobench" / timestamp
+        else:
+            resolved_output_dir = Path("outputs/afrobench-wolof") / timestamp
+    else:
+        resolved_output_dir = output_dir.resolve()
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+
+    runs: list[dict[str, Any]] = []
+    for value in resolved_fewshot_values:
+        result = _run_wolof_afrobench_single_benchmark(
+            model_path=model_path,
+            run_dir=run_dir,
+            adapter_path=adapter_path,
+            tokenizer_path=tokenizer_path,
+            base_model_name=base_model_name,
+            tasks=tasks,
+            prompt_variants=prompt_variants,
+            output_dir=_fewshot_output_dir(resolved_output_dir, value),
+            limit=limit,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+            num_fewshot=value,
+            system_instruction=resolved_system_instruction,
+            device=device,
+            dtype=dtype,
+            merge_adapter=merge_adapter,
+            merge_dtype=merge_dtype,
+            load_in_4bit=load_in_4bit,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+            add_bos_token=add_bos_token,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            log_samples=log_samples,
+            write_out=write_out,
+            bootstrap_iters=bootstrap_iters,
+        )
+        runs.append({"num_fewshot": value, **result})
+
+    summary = {
+        "fewshot_values": resolved_fewshot_values,
+        "system_instruction": resolved_system_instruction,
+        "apply_chat_template": apply_chat_template,
+        "fewshot_as_multiturn": fewshot_as_multiturn,
+        "output_dir": str(resolved_output_dir),
+        "runs": runs,
+    }
+    summary_path = resolved_output_dir / "summary.json"
+    write_json(summary_path, summary)
+
+    report_path = resolved_output_dir / "report.md"
+    ensure_parent(report_path)
+    report_path.write_text(
+        _render_fewshot_benchmark_report(
+            fewshot_values=resolved_fewshot_values,
+            results=runs,
+            summary_path=summary_path,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "fewshot_values": resolved_fewshot_values,
+        "system_instruction": resolved_system_instruction,
+        "apply_chat_template": apply_chat_template,
+        "fewshot_as_multiturn": fewshot_as_multiturn,
+        "output_dir": str(resolved_output_dir),
+        "summary_file": str(summary_path),
+        "report_file": str(report_path),
+        "runs": runs,
+    }
+
+
+def run_wolof_afrobench_epoch_benchmarks(
+    *,
+    run_dir: Path,
+    tasks: str | None = None,
+    prompt_variants: str | None = None,
+    output_dir: Path | None = None,
+    limit: float | None = None,
+    batch_size: str = "auto",
+    max_batch_size: int | None = None,
+    num_fewshot: int = 0,
+    fewshot_values: str | None = None,
+    system_instruction: str | None = DEFAULT_AFROBENCH_SYSTEM_PROMPT,
+    device: str | None = "cuda",
+    dtype: str | None = "auto",
+    merge_adapter: bool = False,
+    merge_dtype: str | None = None,
+    load_in_4bit: bool = False,
+    trust_remote_code: bool = False,
+    use_fast_tokenizer: bool = True,
+    add_bos_token: bool = False,
+    apply_chat_template: bool = True,
+    fewshot_as_multiturn: bool = False,
+    log_samples: bool = False,
+    write_out: bool = False,
+    bootstrap_iters: int = 0,
+) -> dict[str, Any]:
+    resolved_system_instruction = (
+        system_instruction
+        if system_instruction is not None
+        else DEFAULT_AFROBENCH_SYSTEM_PROMPT
+    )
+    resolved_fewshot_values = (
+        _parse_fewshot_values(fewshot_values)
+        if fewshot_values is not None
+        else (
+            list(DEFAULT_AFROBENCH_FEWSHOT_VALUES)
+            if num_fewshot == 0
+            else [num_fewshot]
+        )
+    )
+    if len(resolved_fewshot_values) == 1:
+        return _run_wolof_afrobench_single_epoch_benchmarks(
+            run_dir=run_dir,
+            tasks=tasks,
+            prompt_variants=prompt_variants,
+            output_dir=output_dir,
+            limit=limit,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+            num_fewshot=resolved_fewshot_values[0],
+            system_instruction=resolved_system_instruction,
+            device=device,
+            dtype=dtype,
+            merge_adapter=merge_adapter,
+            merge_dtype=merge_dtype,
+            load_in_4bit=load_in_4bit,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+            add_bos_token=add_bos_token,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            log_samples=log_samples,
+            write_out=write_out,
+            bootstrap_iters=bootstrap_iters,
+        )
+
+    resolved_run_dir = run_dir.resolve()
+    resolved_output_dir = (
+        output_dir.resolve()
+        if output_dir is not None
+        else resolved_run_dir / "afrobench" / "fewshot-epoch-sweep"
+    )
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+
+    runs: list[dict[str, Any]] = []
+    for value in resolved_fewshot_values:
+        result = _run_wolof_afrobench_single_epoch_benchmarks(
+            run_dir=resolved_run_dir,
+            tasks=tasks,
+            prompt_variants=prompt_variants,
+            output_dir=_fewshot_output_dir(resolved_output_dir, value),
+            limit=limit,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+            num_fewshot=value,
+            system_instruction=resolved_system_instruction,
+            device=device,
+            dtype=dtype,
+            merge_adapter=merge_adapter,
+            merge_dtype=merge_dtype,
+            load_in_4bit=load_in_4bit,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+            add_bos_token=add_bos_token,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            log_samples=log_samples,
+            write_out=write_out,
+            bootstrap_iters=bootstrap_iters,
+        )
+        runs.append({"num_fewshot": value, **result})
+
+    summary = {
+        "run_dir": str(resolved_run_dir),
+        "fewshot_values": resolved_fewshot_values,
+        "system_instruction": resolved_system_instruction,
+        "apply_chat_template": apply_chat_template,
+        "fewshot_as_multiturn": fewshot_as_multiturn,
+        "output_dir": str(resolved_output_dir),
+        "runs": runs,
+    }
+    summary_path = resolved_output_dir / "summary.json"
+    write_json(summary_path, summary)
+
+    report_path = resolved_output_dir / "report.md"
+    ensure_parent(report_path)
+    report_path.write_text(
+        _render_fewshot_epoch_report(
+            run_dir=resolved_run_dir,
+            fewshot_values=resolved_fewshot_values,
+            results=runs,
+            summary_path=summary_path,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "run_dir": str(resolved_run_dir),
+        "fewshot_values": resolved_fewshot_values,
+        "system_instruction": resolved_system_instruction,
+        "apply_chat_template": apply_chat_template,
+        "fewshot_as_multiturn": fewshot_as_multiturn,
+        "output_dir": str(resolved_output_dir),
+        "summary_file": str(summary_path),
+        "report_file": str(report_path),
+        "runs": runs,
     }

@@ -200,6 +200,8 @@ fork. It supports:
 - `--all-epochs` to benchmark every saved epoch checkpoint
 - `--merge` to merge a PEFT adapter into the base model in memory before benchmarking
 - `--merge-dtype` to control the merge precision, for example `float16`
+- a benchmark system prompt with chat template enabled by default
+- default few-shot sweeps over `0-shot` and `5-shot`
 
 Key flags:
 - `--tasks`
@@ -207,6 +209,8 @@ Key flags:
 - `--limit`
 - `--batch-size`
 - `--all-epochs`
+- `--fewshot-values`
+- `--system-prompt`
 - `--merge`
 - `--merge-dtype`
 - `--log-samples`
@@ -240,11 +244,19 @@ uv run galsenai wolof benchmark \
   --merge-dtype float16 \
   --tasks afrimmlu,afrixnli,belebele \
   --prompt-variants 1
+
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof/<run-id> \
+  --fewshot-values 0,5 \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1,2,3
 ```
 
 Notes:
 - Without `--merge`, a PEFT run is benchmarked as base model + adapter.
 - With `--merge --merge-dtype float16`, the adapter is first merged into a temporary FP16 model, and AfroBench runs on that merged model instead of the adapter path.
+- The benchmark now uses a strict multilingual instruction-following system prompt by default and enables the chat template by default.
+- When `--fewshot-values` is omitted, the benchmark runs both `0-shot` and `5-shot`. Each run is saved under its own subdirectory such as `0-shot/` and `5-shot/`.
 - Broken Wolof prompt variants are skipped automatically. In the current AfroBench build, `afrimmlu` prompt variants `4` and `5` are blacklisted because the upstream templates leave placeholders like `{subject}` unresolved.
 
 ### `galsenai wolof upload`
