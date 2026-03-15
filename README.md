@@ -198,6 +198,8 @@ fork. It supports:
 - `--run-dir` for a training run folder
 - `--model-path` for a local model or HF repo
 - `--all-epochs` to benchmark every saved epoch checkpoint
+- `--merge` to merge a PEFT adapter into the base model in memory before benchmarking
+- `--merge-dtype` to control the merge precision, for example `float16`
 
 Key flags:
 - `--tasks`
@@ -205,6 +207,8 @@ Key flags:
 - `--limit`
 - `--batch-size`
 - `--all-epochs`
+- `--merge`
+- `--merge-dtype`
 - `--log-samples`
 - `--write-out`
 
@@ -229,7 +233,18 @@ uv run galsenai wolof benchmark \
   --model-path your-username/your-wolof-model \
   --tasks afrimmlu,afrixnli,belebele \
   --prompt-variants 1
+
+uv run galsenai wolof benchmark \
+  --run-dir outputs/wolof/<run-id> \
+  --merge \
+  --merge-dtype float16 \
+  --tasks afrimmlu,afrixnli,belebele \
+  --prompt-variants 1
 ```
+
+Notes:
+- Without `--merge`, a PEFT run is benchmarked as base model + adapter.
+- With `--merge --merge-dtype float16`, the adapter is first merged into a temporary FP16 model, and AfroBench runs on that merged model instead of the adapter path.
 
 ### `galsenai wolof upload`
 

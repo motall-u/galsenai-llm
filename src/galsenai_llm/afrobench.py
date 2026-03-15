@@ -3,12 +3,20 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import tempfile
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from .generation import (
+    _load_causal_lm,
+    _load_tokenizer,
+    _quiet_transformers_output,
+    resolve_torch_dtype,
+)
 from .io import ensure_parent, write_json
 
 AFROBENCH_WOLOF_TASK_TEMPLATES: dict[str, str] = {
@@ -50,6 +58,8 @@ class AfroBenchModelSpec:
     base_model_name: str | None
     model_kind: str
     source_reference: str
+    merged_adapter: bool = False
+    merge_dtype: str | None = None
 
 
 def _load_json_object(path: Path) -> dict[str, Any]:
@@ -377,6 +387,49 @@ def _build_model_args(
     return ",".join(model_args)
 
 
+def _materialize_merged_model(
+    *,
+    model_spec: AfroBenchModelSpec,
+    target_dir: Path,
+    merge_dtype: str,
+) -> AfroBenchModelSpec:
+    if not model_spec.adapter_path:
+        return model_spec
+    base_model_name = model_spec.base_model_name or model_spec.pretrained_model
+    tokenizer_ref = model_spec.tokenizer_path or model_spec.adapter_path
+
+    from peft import PeftModel
+
+    merged_model_dtype = resolve_torch_dtype(merge_dtype)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with _quiet_transformers_output():
+        tokenizer = _load_tokenizer(tokenizer_ref)
+        base_model = _load_causal_lm(
+            base_model_name,
+            device_map="auto",
+            dtype=merged_model_dtype,
+        )
+        if len(tokenizer) != base_model.get_input_embeddings().weight.shape[0]:
+            base_model.resize_token_embeddings(len(tokenizer))
+        merged_model = PeftModel.from_pretrained(
+            base_model,
+            model_spec.adapter_path,
+        ).merge_and_unload()
+        merged_model.save_pretrained(str(target_dir))
+        tokenizer.save_pretrained(str(target_dir))
+
+    return AfroBenchModelSpec(
+        pretrained_model=str(target_dir),
+        tokenizer_path=str(target_dir),
+        adapter_path=None,
+        base_model_name=base_model_name,
+        model_kind="merged_adapter",
+        source_reference=model_spec.source_reference,
+        merged_adapter=True,
+        merge_dtype=merge_dtype,
+    )
+
+
 def _write_json_payload(path: Path, payload: dict[str, Any]) -> None:
     ensure_parent(path)
     with path.open("w", encoding="utf-8") as handle:
@@ -497,6 +550,8 @@ def _render_report_markdown(
 
 - Source reference: `{model_spec.source_reference}`
 - Model kind: `{model_spec.model_kind}`
+- Adapter merged before benchmark: `{model_spec.merged_adapter}`
+- Merge dtype: `{model_spec.merge_dtype or 'n/a'}`
 - Base model: `{model_spec.base_model_name or model_spec.pretrained_model}`
 - Pretrained model reference passed to `lm_eval`: `{model_spec.pretrained_model}`
 - Tokenizer path: `{model_spec.tokenizer_path or model_spec.pretrained_model}`
@@ -595,6 +650,8 @@ def run_wolof_afrobench_benchmark(
     num_fewshot: int = 0,
     device: str | None = "cuda",
     dtype: str | None = "auto",
+    merge_adapter: bool = False,
+    merge_dtype: str | None = None,
     load_in_4bit: bool = False,
     trust_remote_code: bool = False,
     use_fast_tokenizer: bool = True,
@@ -627,15 +684,6 @@ def run_wolof_afrobench_benchmark(
         tokenizer_path=tokenizer_path,
         base_model_name=base_model_name,
     )
-    model_args = _build_model_args(
-        model_spec=model_spec,
-        dtype=dtype,
-        load_in_4bit=load_in_4bit,
-        trust_remote_code=trust_remote_code,
-        use_fast_tokenizer=use_fast_tokenizer,
-        add_bos_token=add_bos_token,
-    )
-
     if output_dir is None:
         timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         if run_dir is not None:
@@ -646,32 +694,65 @@ def run_wolof_afrobench_benchmark(
         resolved_output_dir = output_dir.resolve()
     resolved_output_dir.mkdir(parents=True, exist_ok=True)
 
-    task_manager = TaskManager("ERROR")
-    missing_tasks = [
-        task_name for task_name in expanded_tasks if task_name not in task_manager.all_tasks
-    ]
-    if missing_tasks:
-        raise ValueError(
-            "The installed lm-evaluation-harness build does not expose these AfroBench tasks: "
-            + ", ".join(missing_tasks)
+    with ExitStack() as exit_stack:
+        if merge_adapter and model_spec.adapter_path:
+            resolved_merge_dtype = (
+                merge_dtype
+                if merge_dtype not in {None, "", "auto", "none"}
+                else (dtype if dtype not in {None, "", "auto", "none"} else "float16")
+            )
+            merged_dir = Path(
+                exit_stack.enter_context(
+                    tempfile.TemporaryDirectory(prefix="galsenai-afrobench-merge-")
+                )
+            ) / "merged-model"
+            model_spec = _materialize_merged_model(
+                model_spec=model_spec,
+                target_dir=merged_dir,
+                merge_dtype=resolved_merge_dtype,
+            )
+
+        effective_load_in_4bit = load_in_4bit and not model_spec.merged_adapter
+        effective_dtype = (
+            model_spec.merge_dtype
+            if model_spec.merged_adapter and dtype in {None, "", "auto", "none"}
+            else dtype
+        )
+        model_args = _build_model_args(
+            model_spec=model_spec,
+            dtype=effective_dtype,
+            load_in_4bit=effective_load_in_4bit,
+            trust_remote_code=trust_remote_code,
+            use_fast_tokenizer=use_fast_tokenizer,
+            add_bos_token=add_bos_token,
         )
 
-    raw_results = evaluator.simple_evaluate(
-        model="hf",
-        model_args=model_args,
-        tasks=expanded_tasks,
-        task_manager=task_manager,
-        num_fewshot=num_fewshot if num_fewshot > 0 else None,
-        batch_size=batch_size,
-        max_batch_size=max_batch_size,
-        device=device,
-        limit=limit,
-        log_samples=log_samples,
-        write_out=write_out,
-        bootstrap_iters=bootstrap_iters,
-        apply_chat_template=apply_chat_template,
-        fewshot_as_multiturn=fewshot_as_multiturn,
-    )
+        task_manager = TaskManager("ERROR")
+        missing_tasks = [
+            task_name for task_name in expanded_tasks if task_name not in task_manager.all_tasks
+        ]
+        if missing_tasks:
+            raise ValueError(
+                "The installed lm-evaluation-harness build does not expose these AfroBench tasks: "
+                + ", ".join(missing_tasks)
+            )
+
+        raw_results = evaluator.simple_evaluate(
+            model="hf",
+            model_args=model_args,
+            tasks=expanded_tasks,
+            task_manager=task_manager,
+            num_fewshot=num_fewshot if num_fewshot > 0 else None,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+            device=device,
+            limit=limit,
+            log_samples=log_samples,
+            write_out=write_out,
+            bootstrap_iters=bootstrap_iters,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+        )
 
     raw_results_path = resolved_output_dir / "raw_results.json"
     _write_json_payload(raw_results_path, raw_results)
@@ -695,8 +776,12 @@ def run_wolof_afrobench_benchmark(
         "max_batch_size": max_batch_size,
         "num_fewshot": num_fewshot,
         "device": device,
-        "dtype": dtype,
-        "load_in_4bit": load_in_4bit,
+        "dtype": effective_dtype,
+        "requested_dtype": dtype,
+        "merge_adapter": model_spec.merged_adapter,
+        "merge_dtype": model_spec.merge_dtype,
+        "load_in_4bit": effective_load_in_4bit,
+        "requested_load_in_4bit": load_in_4bit,
         "trust_remote_code": trust_remote_code,
         "apply_chat_template": apply_chat_template,
         "fewshot_as_multiturn": fewshot_as_multiturn,
@@ -741,8 +826,12 @@ def run_wolof_afrobench_benchmark(
         "num_fewshot": num_fewshot,
         "limit": limit,
         "device": device,
-        "dtype": dtype,
-        "load_in_4bit": load_in_4bit,
+        "dtype": effective_dtype,
+        "requested_dtype": dtype,
+        "merge_adapter": model_spec.merged_adapter,
+        "merge_dtype": model_spec.merge_dtype,
+        "load_in_4bit": effective_load_in_4bit,
+        "requested_load_in_4bit": load_in_4bit,
         "compatibility_patch_applied": compatibility_patch_applied,
         "output_dir": str(resolved_output_dir),
         "summary_file": str(summary_path),
@@ -763,6 +852,8 @@ def run_wolof_afrobench_epoch_benchmarks(
     num_fewshot: int = 0,
     device: str | None = "cuda",
     dtype: str | None = "auto",
+    merge_adapter: bool = False,
+    merge_dtype: str | None = None,
     load_in_4bit: bool = False,
     trust_remote_code: bool = False,
     use_fast_tokenizer: bool = True,
@@ -809,6 +900,8 @@ def run_wolof_afrobench_epoch_benchmarks(
             num_fewshot=num_fewshot,
             device=device,
             dtype=dtype,
+            merge_adapter=merge_adapter,
+            merge_dtype=merge_dtype,
             load_in_4bit=load_in_4bit,
             trust_remote_code=trust_remote_code,
             use_fast_tokenizer=use_fast_tokenizer,

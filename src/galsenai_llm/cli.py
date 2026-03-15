@@ -411,6 +411,22 @@ def wolof_benchmark(
         "--base-model-name",
         help="Override the base model name when benchmarking a PEFT adapter.",
     ),
+    merge: bool = typer.Option(
+        False,
+        "--merge/--no-merge",
+        help=(
+            "When benchmarking a PEFT adapter, merge it into the base model in memory "
+            "before running lm-evaluation-harness."
+        ),
+    ),
+    merge_dtype: str | None = typer.Option(
+        None,
+        "--merge-dtype",
+        help=(
+            "Optional torch dtype used when loading the base model for the benchmark-time "
+            "adapter merge, for example float16, bfloat16, or float32."
+        ),
+    ),
     tasks: str = typer.Option(
         "afrimmlu,afrixnli,belebele",
         "--tasks",
@@ -484,6 +500,8 @@ def wolof_benchmark(
                 num_fewshot=num_fewshot,
                 device=device,
                 dtype=dtype,
+                merge_adapter=merge,
+                merge_dtype=merge_dtype,
                 load_in_4bit=load_in_4bit,
                 trust_remote_code=trust_remote_code,
                 use_fast_tokenizer=use_fast_tokenizer,
@@ -513,6 +531,8 @@ def wolof_benchmark(
             num_fewshot=num_fewshot,
             device=device,
             dtype=dtype,
+            merge_adapter=merge,
+            merge_dtype=merge_dtype,
             load_in_4bit=load_in_4bit,
             trust_remote_code=trust_remote_code,
             use_fast_tokenizer=use_fast_tokenizer,
