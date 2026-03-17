@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import typer
 from rich.console import Console
@@ -139,6 +140,16 @@ def wolof_infer(
     ),
     device_map: str = typer.Option("auto", "--device-map"),
     dtype: str | None = typer.Option("bfloat16", "--dtype"),
+    context_window: int | None = typer.Option(
+        None,
+        "--context-window",
+        "--max-input-tokens",
+        min=1,
+        help=(
+            "Maximum number of input prompt tokens to keep before generation. "
+            "Uses left-side truncation so the newest tokens are preserved."
+        ),
+    ),
     max_new_tokens: int = typer.Option(128, "--max-new-tokens"),
     do_sample: bool = typer.Option(False, "--do-sample"),
     temperature: float = typer.Option(0.0, "--temperature"),
@@ -157,6 +168,7 @@ def wolof_infer(
             merge_adapter=merge,
             merge_dtype=merge_dtype,
             system_prompt=system_prompt,
+            context_window=context_window,
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             temperature=temperature,
@@ -196,6 +208,16 @@ def wolof_chat(
     ),
     device_map: str = typer.Option("auto", "--device-map"),
     dtype: str | None = typer.Option("bfloat16", "--dtype"),
+    context_window: int | None = typer.Option(
+        None,
+        "--context-window",
+        "--max-input-tokens",
+        min=1,
+        help=(
+            "Maximum number of input prompt tokens to keep before generation. "
+            "Uses left-side truncation so the newest tokens are preserved."
+        ),
+    ),
     max_new_tokens: int = typer.Option(128, "--max-new-tokens"),
     do_sample: bool = typer.Option(False, "--do-sample"),
     temperature: float = typer.Option(0.0, "--temperature"),
@@ -213,6 +235,7 @@ def wolof_chat(
         merge_adapter=merge,
         merge_dtype=merge_dtype,
         system_prompt=system_prompt,
+        context_window=context_window,
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
         temperature=temperature,
@@ -338,6 +361,14 @@ def wolof_run(
         "--full-epochs",
         help="Number of epochs for the final fine-tuning stage. Maximum: 3.",
     ),
+    force_method: Literal["method_a", "method_b", "method_c"] | None = typer.Option(
+        None,
+        "--force-method",
+        help=(
+            "Skip automatic tokenizer-method selection and force a specific "
+            "method for the benchmark and final run."
+        ),
+    ),
     include_method_c: bool = typer.Option(False, "--include-method-c/--no-method-c"),
     seed: int = typer.Option(3407, "--seed"),
 ) -> None:
@@ -369,6 +400,7 @@ def wolof_run(
             full_bpe_vocab_size=full_bpe_vocab_size,
             benchmark_epochs=benchmark_epochs,
             full_epochs=full_epochs,
+            force_method=force_method,
             include_method_c=include_method_c,
             seed=seed,
         )

@@ -7,7 +7,11 @@ from typing import Any
 from rich.console import Console
 
 from .config import GenerationConfig, InferenceConfig
-from .generation import build_generation_pipeline, generate_first_assistant
+from .generation import (
+    build_generation_pipeline,
+    generate_first_assistant,
+    resolve_context_window,
+)
 from .schemas import Message
 
 
@@ -40,6 +44,7 @@ def run_prompt_inference(
     merge_adapter: bool = False,
     merge_dtype: str | None = None,
     system_prompt: str | None = None,
+    context_window: int | None = None,
     max_new_tokens: int = 256,
     do_sample: bool = False,
     temperature: float = 0.0,
@@ -63,6 +68,10 @@ def run_prompt_inference(
         merge_adapter=merge_adapter,
         merge_dtype=merge_dtype,
     )
+    effective_context_window = resolve_context_window(
+        getattr(pipe, "tokenizer", None),
+        context_window,
+    )
     assistant = generate_first_assistant(
         pipe=pipe,
         messages=messages,
@@ -74,6 +83,7 @@ def run_prompt_inference(
         ),
         tool_names=[],
         tool_registry="none",
+        context_window=context_window,
     )
     model_info = getattr(pipe, "_galsenai_model_info", {})
     return {
@@ -83,6 +93,8 @@ def run_prompt_inference(
         "prompt": prompt,
         "merge_adapter": merge_adapter,
         "merge_dtype": merge_dtype if merge_adapter else None,
+        "context_window": context_window,
+        "effective_context_window": effective_context_window,
         "assistant": assistant.model_dump(mode="json", exclude_none=True),
     }
 
@@ -100,6 +112,7 @@ def run_inference(config: InferenceConfig, prompt_override: str | None = None) -
         device_map=config.device_map,
         dtype=config.dtype,
         system_prompt=config.system_prompt,
+        context_window=config.context_window,
         max_new_tokens=config.generation.max_new_tokens,
         do_sample=config.generation.do_sample,
         temperature=config.generation.temperature,
@@ -117,6 +130,7 @@ def run_chat_session(
     merge_adapter: bool = False,
     merge_dtype: str | None = None,
     system_prompt: str | None = None,
+    context_window: int | None = None,
     max_new_tokens: int = 256,
     do_sample: bool = False,
     temperature: float = 0.0,
@@ -132,6 +146,10 @@ def run_chat_session(
         dtype=dtype,
         merge_adapter=merge_adapter,
         merge_dtype=merge_dtype,
+    )
+    effective_context_window = resolve_context_window(
+        getattr(pipe, "tokenizer", None),
+        context_window,
     )
 
     history: list[Message] = []
@@ -166,6 +184,7 @@ def run_chat_session(
             ),
             tool_names=[],
             tool_registry="none",
+            context_window=context_window,
         )
         history.append(assistant)
         console.print(f"[bold green]Assistant[/bold green]> {_assistant_display_text(assistant)}")
@@ -181,6 +200,8 @@ def run_chat_session(
         "resolved_model": getattr(pipe, "_galsenai_model_info", {}),
         "merge_adapter": merge_adapter,
         "merge_dtype": merge_dtype if merge_adapter else None,
+        "context_window": context_window,
+        "effective_context_window": effective_context_window,
         "turns": turns,
         "stop_reason": stop_reason,
     }

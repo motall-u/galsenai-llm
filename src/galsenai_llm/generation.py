@@ -4,7 +4,7 @@ import copy
 import json
 import warnings
 from collections.abc import Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,8 @@ from .config import GenerationConfig
 from .schemas import Message, ToolCall, ToolFunctionCall
 from .tool_registry import get_tool_functions
 
+_KNOWN_TOKENIZER_MAX_LENGTH_CEILING = 1_000_000_000
+
 
 def resolve_torch_dtype(dtype_name: str | None) -> Any:
     if dtype_name in {None, "", "auto", "none"}:
@@ -23,6 +25,21 @@ def resolve_torch_dtype(dtype_name: str | None) -> Any:
     if not hasattr(torch, dtype_name):
         raise ValueError(f"Unsupported torch dtype: {dtype_name}")
     return getattr(torch, dtype_name)
+
+
+def resolve_context_window(tokenizer: Any, context_window: int | None) -> int | None:
+    if context_window is None:
+        return None
+    if context_window <= 0:
+        raise ValueError("Context window must be a positive integer.")
+
+    tokenizer_limit = getattr(tokenizer, "model_max_length", None)
+    if (
+        isinstance(tokenizer_limit, int)
+        and 0 < tokenizer_limit < _KNOWN_TOKENIZER_MAX_LENGTH_CEILING
+    ):
+        return min(context_window, tokenizer_limit)
+    return context_window
 
 
 def _detect_peft_base_model(reference: str | Path) -> str | None:
@@ -103,6 +120,20 @@ def _quiet_transformers_output() -> Any:
     transformers_logging.set_verbosity(verbosity)
     if progress_bar_enabled:
         transformers_logging.enable_progress_bar()
+
+
+@contextmanager
+def _temporary_tokenizer_truncation_side(tokenizer: Any, truncation_side: str) -> Any:
+    if tokenizer is None or not hasattr(tokenizer, "truncation_side"):
+        yield
+        return
+
+    original_truncation_side = tokenizer.truncation_side
+    tokenizer.truncation_side = truncation_side
+    try:
+        yield
+    finally:
+        tokenizer.truncation_side = original_truncation_side
 
 
 def _build_generation_config(model: Any, generation: GenerationConfig) -> Any:
@@ -287,6 +318,7 @@ def generate_first_assistant(
     generation: GenerationConfig,
     tool_names: Sequence[str] | None = None,
     tool_registry: str = "none",
+    context_window: int | None = None,
 ) -> Message:
     payload = [message_to_chat_dict(message) for message in messages]
     kwargs: dict[str, Any] = {}
@@ -303,7 +335,21 @@ def generate_first_assistant(
     if tool_registry == "sample" and tool_names:
         kwargs["tools"] = get_tool_functions(tool_names)
 
-    with _quiet_transformers_output():
+    effective_context_window = resolve_context_window(
+        getattr(pipe, "tokenizer", None),
+        context_window,
+    )
+    if effective_context_window is not None:
+        kwargs["truncation"] = True
+        kwargs["tokenizer_encode_kwargs"] = {"max_length": effective_context_window}
+
+    truncation_context = (
+        _temporary_tokenizer_truncation_side(getattr(pipe, "tokenizer", None), "left")
+        if effective_context_window is not None
+        else nullcontext()
+    )
+
+    with truncation_context, _quiet_transformers_output():
         response = pipe(payload, **kwargs)
     generated_output = response[0]["generated_text"] if isinstance(response, list) else response
     return extract_assistant_message(generated_output)

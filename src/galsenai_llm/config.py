@@ -112,6 +112,7 @@ class InferenceConfig(YamlConfig):
     dtype: str | None = None
     prompt: str | None = None
     system_prompt: str | None = None
+    context_window: int | None = Field(default=None, gt=0)
     tool_registry: Literal["none", "sample"] = "none"
     tools: list[str] = Field(default_factory=list)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)

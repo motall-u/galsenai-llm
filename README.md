@@ -74,6 +74,7 @@ Common flags:
 - `--merge`: merge a PEFT adapter into the base model in memory before generation
 - `--merge-dtype`: dtype used for the in-memory merge, for example `float16`
 - `--system-prompt`: override the default multilingual assistant prompt
+- `--context-window` / `--max-input-tokens`: cap the input prompt tokens before generation
 - `--max-new-tokens`
 - `--do-sample`, `--temperature`, `--top-p`
 
@@ -90,6 +91,7 @@ uv run galsenai wolof infer \
   --model-path your-username/your-wolof-adapter \
   --merge \
   --merge-dtype float16 \
+  --context-window 4096 \
   --prompt "Who is Sadio Mane?"
 ```
 
@@ -98,6 +100,8 @@ Notes:
 - If you add `--merge`, the adapter is merged into the base model in memory before inference.
 - `--merge` is useful when you want merged-model behavior without saving a separate merged checkpoint.
 - `--merge` matters only for adapter loading; on a full model repo or full local model, inference runs normally without a merge step.
+- `--context-window` caps only the input prompt. The generated output length is still controlled by `--max-new-tokens`.
+- Input truncation is left-sided, so the newest turns are preserved if the prompt exceeds the cap.
 
 ### `galsenai wolof chat`
 
@@ -109,6 +113,7 @@ Useful flags:
 - `--merge`
 - `--merge-dtype`
 - `--system-prompt`
+- `--context-window` / `--max-input-tokens`
 - `--max-new-tokens`
 - `--max-turns`
 
@@ -122,7 +127,8 @@ uv run galsenai wolof chat \
 uv run galsenai wolof chat \
   --model-path your-username/your-wolof-adapter \
   --merge \
-  --merge-dtype float16
+  --merge-dtype float16 \
+  --context-window 4096
 ```
 
 ### `galsenai wolof run`
@@ -138,6 +144,7 @@ Key flags:
 - `--benchmark-samples`, `--full-samples`
 - `--benchmark-epochs`, `--full-epochs`
 - `--token-budget`
+- `--force-method`: skip automatic tokenizer-method selection and force one method
 - `--english-replay-dataset`, `--math-replay-dataset`
 - `--wolof-mix-ratio`, `--english-mix-ratio`, `--math-mix-ratio`
 - `--include-method-c`
@@ -149,6 +156,17 @@ Examples:
 uv run galsenai wolof run \
   --dataset-file data/wolof-dataset/curated_dataset.json \
   --method-a-text-corpus-file data/wolof-dataset/collections/curated_text.txt
+
+uv run galsenai wolof run \
+  --model-name Qwen/Qwen2.5-3B-Instruct \
+  --dataset-file data/wolof-dataset/curated_dataset_extended.json \
+  --method-a-text-corpus-file data/wolof-dataset/collections/curated_text.txt \
+  --force-method method_a \
+  --benchmark-samples 1000 \
+  --full-samples 133799 \
+  --benchmark-epochs 1 \
+  --full-epochs 2 \
+  --output-dir outputs/wolof-qwen3b-method-a
 
 uv run galsenai wolof run \
   --model-name Qwen/Qwen2.5-3B-Instruct \

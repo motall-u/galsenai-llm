@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import quantiles
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
@@ -48,6 +48,7 @@ from .io import ensure_parent
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+TOKENIZER_METHOD_NAMES = ("method_a", "method_b", "method_c")
 TARGET_MODULES = [
     "q_proj",
     "k_proj",
@@ -2604,6 +2605,20 @@ def _pick_winner(results: Sequence[dict[str, Any]]) -> dict[str, Any]:
     )
 
 
+def _resolve_benchmark_methods(
+    *,
+    include_method_c: bool,
+    force_method: Literal["method_a", "method_b", "method_c"] | None,
+) -> list[str]:
+    if force_method is not None:
+        return [force_method]
+
+    benchmark_methods = ["method_a", "method_b"]
+    if include_method_c:
+        benchmark_methods.append("method_c")
+    return benchmark_methods
+
+
 def _format_float(value: float | None, digits: int = 4) -> str:
     if value is None:
         return "n/a"
@@ -2615,7 +2630,7 @@ def _build_markdown_report(
     output_dir: Path,
     gpu_profile: GpuProfile,
     model_name: str,
-    method_a_text_corpus_file: Path,
+    method_a_text_corpus_file: Path | None,
     method_a_text_count: int,
     benchmark_results: Sequence[dict[str, Any]],
     winner: dict[str, Any],
@@ -2626,6 +2641,7 @@ def _build_markdown_report(
     math_replay_metadata: dict[str, Any] | None,
     train_mix_metadata: dict[str, Any] | None,
     final_train_record_count: int,
+    forced_method: str | None,
 ) -> str:
     method_names = {result["method"] for result in benchmark_results}
     benchmark_rows = "\n".join(
@@ -2752,13 +2768,19 @@ def _build_markdown_report(
             ]
         )
     reference_lines = "\n".join(reference_sections)
-    recommendation_line = (
-        "this method achieved the best validation perplexity on the held-out "
-        "benchmark split. The secondary checks on fertility, single-token "
-        "coverage, and embedding initialization quality also stayed "
-        "competitive enough to make it the safer choice for the larger "
-        "fine-tune."
-    )
+    if forced_method is None:
+        recommendation_line = (
+            "this method achieved the best validation perplexity on the held-out "
+            "benchmark split. The secondary checks on fertility, single-token "
+            "coverage, and embedding initialization quality also stayed "
+            "competitive enough to make it the safer choice for the larger "
+            "fine-tune."
+        )
+    else:
+        recommendation_line = (
+            f"this run forced `{forced_method}` via CLI, so automatic tokenizer "
+            "method selection was skipped for the final fine-tune."
+        )
     replay_lines: list[str] = []
 
     def _append_replay_lines(
@@ -2813,6 +2835,14 @@ def _build_markdown_report(
         ]
     )
     replay_block = "\n".join(replay_lines)
+    method_a_corpus_label = (
+        str(method_a_text_corpus_file) if method_a_text_corpus_file is not None else "not used"
+    )
+    forced_method_line = (
+        f"- Forced tokenizer method: `{forced_method}`"
+        if forced_method is not None
+        else "- Forced tokenizer method: automatic selection"
+    )
 
     report = f"""# Wolof Qwen 2.5 Fine-Tuning Report
 
@@ -2845,8 +2875,9 @@ def _build_markdown_report(
 - Wolof full-pool sample size: {full_sample_total} conversations
 - Wolof full split: {full_split_line}
 - Stratification: turn-count bucket plus conversation-length quartile
-- Method A reference text corpus: `{method_a_text_corpus_file}`
+- Method A reference text corpus: `{method_a_corpus_label}`
 - Method A reference text entries: {method_a_text_count}
+{forced_method_line}
 - Final-stage replay policy: mix optional English and math replay only into
   the final training set, not the tokenizer benchmark
 - Tokenizer rebuild policy for Step 2: reuse the winning adaptation
@@ -2923,6 +2954,7 @@ def run_wolof_pipeline(
     full_bpe_vocab_size: int = 16384,
     benchmark_epochs: int = 3,
     full_epochs: int = 3,
+    force_method: Literal["method_a", "method_b", "method_c"] | None = None,
     include_method_c: bool = False,
     seed: int = 3407,
 ) -> dict[str, Any]:
@@ -2938,7 +2970,11 @@ def run_wolof_pipeline(
             "Final fine-tuning is capped at 3 epochs so epoch checkpoints stay "
             "manageable for downstream benchmarking."
         )
-    if method_a_text_corpus_file is None:
+    benchmark_methods = _resolve_benchmark_methods(
+        include_method_c=include_method_c,
+        force_method=force_method,
+    )
+    if method_a_text_corpus_file is None and "method_a" in benchmark_methods:
         raise ValueError(
             "Method A now requires a separate text-only corpus. "
             "Pass --method-a-text-corpus-file <path>."
@@ -2958,14 +2994,16 @@ def run_wolof_pipeline(
     )
 
     records = load_wolof_dataset(dataset_file)
-    method_a_reference_texts = load_text_corpus(method_a_text_corpus_file)
-    _write_json_payload(
-        output_dir / "method_a_text_corpus.json",
-        {
-            "path": str(method_a_text_corpus_file),
-            "text_count": len(method_a_reference_texts),
-        },
-    )
+    method_a_reference_texts: list[str] = []
+    if method_a_text_corpus_file is not None:
+        method_a_reference_texts = load_text_corpus(method_a_text_corpus_file)
+        _write_json_payload(
+            output_dir / "method_a_text_corpus.json",
+            {
+                "path": str(method_a_text_corpus_file),
+                "text_count": len(method_a_reference_texts),
+            },
+        )
     benchmark_pool, remaining = stratified_sample(records, benchmark_sample_size, seed=seed)
     benchmark_counts = _ratio_split_counts(
         benchmark_sample_size,
@@ -3130,10 +3168,6 @@ def run_wolof_pipeline(
         },
     )
 
-    benchmark_methods = ["method_a", "method_b"]
-    if include_method_c:
-        benchmark_methods.append("method_c")
-
     benchmark_results = []
     for method_name in benchmark_methods:
         method_dir = benchmark_dir / method_name
@@ -3156,6 +3190,7 @@ def run_wolof_pipeline(
     comparison = {
         "results": benchmark_results,
         "winner": winner["method"],
+        "forced_method": force_method,
     }
     _write_json_payload(benchmark_dir / "comparison.json", comparison)
 
@@ -3240,13 +3275,16 @@ def run_wolof_pipeline(
         math_replay_metadata=math_replay_metadata,
         train_mix_metadata=train_mix_metadata,
         final_train_record_count=len(final_train_records),
+        forced_method=force_method,
     )
     report_path = output_dir / "wolof_finetuning_report.md"
     _write_text(report_path, markdown_report)
 
     summary = {
         "dataset_file": str(dataset_file),
-        "method_a_text_corpus_file": str(method_a_text_corpus_file),
+        "method_a_text_corpus_file": (
+            None if method_a_text_corpus_file is None else str(method_a_text_corpus_file)
+        ),
         "method_a_text_count": len(method_a_reference_texts),
         "output_dir": str(output_dir),
         "model_name": model_name,
@@ -3254,6 +3292,7 @@ def run_wolof_pipeline(
         "benchmark_methods": benchmark_methods,
         "benchmark_results": benchmark_results,
         "winner": winner["method"],
+        "forced_method": force_method,
         "english_replay": english_replay_metadata,
         "math_replay": math_replay_metadata,
         "train_mix": train_mix_metadata,

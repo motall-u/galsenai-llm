@@ -3,6 +3,8 @@ device_map: auto
 dtype: null
 prompt: Find the sum of a = [1, -1, 2] and b = [3, 0, -4].
 system_prompt: You are a helpful tool-calling assistant.
+# Optional: cap the input prompt tokens before generation.
+context_window: 4096
 tool_registry: sample
 tools:
   - get_vector_sum
